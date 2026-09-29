@@ -1,6 +1,9 @@
 // Corte + fade-out del final. Lógica pura (sin DOM ni WebAudio): corre igual en Node y en el navegador.
 
-export const CUT_PREROLL_SEC = 0.004;   // el llamador corta este tanto antes del beat (renderEdit usa cutTime tal cual)
+// El llamador corta este tanto antes del beat (renderEdit usa cutTime tal cual). 20 ms: tras afinar los beats,
+// el primer ataque real del "1" puede ir > 10 ms antes del beat detectado; con 8 ms el ataque del "1" quitado
+// empezaba antes del corte en 8 de 48 cortes (suite sintética), con 20 ms en 3 de 48.
+export const CUT_PREROLL_SEC = 0.02;
 export const ANTICLICK_SEC = 0.005;     // fade mínimo que siempre se aplica en el corte
 export const FADE_CURVES = ['linear', 'smooth', 'exp'];   // UI: Lineal / Suave / Exponencial
 
@@ -19,6 +22,17 @@ export function fadeGain(x, curve) {
     default:   // 'smooth': coseno elevado (pendiente 0 en ambos extremos)
       return 0.5 * (1 + Math.cos(Math.PI * x));
   }
+}
+
+// Ganancias del fade-out de `len` muestras (la última vale 0) para las posiciones [from, to) del fade.
+// Float32 para que el corte (renderEdit) y los empalmes (splice.js) den exactamente las mismas muestras.
+export function fadeOutGains(len, curve, from = 0, to = len) {
+  const a = Math.max(0, Math.min(len, from));
+  const b = Math.max(a, Math.min(len, to));
+  const crv = FADE_CURVES.includes(curve) ? curve : 'smooth';
+  const g = new Float32Array(b - a);
+  for (let i = a; i < b; i++) g[i - a] = fadeGain((i + 1) / len, crv);
+  return g;
 }
 
 function toSeconds(v, fallback) {
@@ -43,12 +57,10 @@ export function renderEdit(channels, sampleRate, { cutTime, fadeSec = 0, curve =
   const fadeSecSafe = Math.max(0, toSeconds(fadeSec, 0));
   const fadeLen = Math.min(cutSample, Math.round(Math.max(fadeSecSafe, ANTICLICK_SEC) * sr));
   const fadeStart = cutSample - fadeLen;
-  const crv = FADE_CURVES.includes(curve) ? curve : 'smooth';
 
   // Ganancias sólo para la parte del fade que cae dentro del tramo pedido
   const from = Math.max(fadeStart, startSample);
-  const gains = new Float32Array(cutSample - from);
-  for (let i = from; i < cutSample; i++) gains[i - from] = fadeGain((i - fadeStart + 1) / fadeLen, crv);
+  const gains = fadeOutGains(fadeLen, curve, from - fadeStart, fadeLen);
 
   return srcs.map((src) => {
     const out = new Float32Array(len);

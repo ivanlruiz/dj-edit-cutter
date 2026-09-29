@@ -3,8 +3,9 @@ import assert from 'node:assert/strict';
 import {
   METER_PRESETS, describeMeterChange, planMeterChange, sourceToOutputTime, outputToSourceTime,
 } from '../js/core/meter.js';
+import { CUT_PREROLL_SEC } from '../js/audio/edit.js';
 
-const P = 0.004;
+const P = CUT_PREROLL_SEC;   // pre-roll por defecto del plan (20 ms)
 const TOO_SHORT = 'Ese compás es demasiado corto para esta canción.';
 const TOO_LONG = 'Ese compás es demasiado largo: como máximo se puede duplicar el compás.';
 const SAME = 'La canción ya está en ese compás.';
@@ -314,6 +315,20 @@ test('plan sin limitTime: el compás del golpe final y el ring-out quedan intact
   const lastRemoved = withHit.removed[withHit.removed.length - 1];
   assert.ok(lastRemoved.end <= r.beats[r.downbeats[16]]);
   checkInvariants(withHit, r.duration);
+});
+
+test('plan con limitTime dentro de la cola: el compás final tampoco se toca (corte manual en el ring-out)', () => {
+  const r = makeResult({ barBeats: [...Array(19).fill(4), 3] });
+  const finalStart = r.beats[r.downbeats[16]];
+  const res = { ...r, lastOnset: finalStart + 0.01 };   // golpe final en el "1" del compás 17; luego suena la cola
+  for (const limitTime of [finalStart + 1.7, r.beats[r.downbeats[18]] + 0.3, r.duration - 0.1]) {
+    for (const [num, den] of [[7, 8], [5, 4]]) {
+      const plan = planMeterChange(res, { targetNum: num, targetDen: den, limitTime });
+      assert.equal(plan.barsChanged, 16, `${num}/${den} corte ${limitTime}`);
+      for (const sl of [...plan.removed, ...plan.repeated]) assert.ok(sl.end <= finalStart + 1e-9);
+      checkInvariants(plan, limitTime);
+    }
+  }
 });
 
 test('plan: snap solo en límites internos y solo si mueve < 25 ms', () => {

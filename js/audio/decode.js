@@ -481,9 +481,17 @@ export function createResampler(fromRate, toRate, { zeroCrossings = 12, rolloff 
     from,
     to,
     outLength: (n) => Math.ceil((n * to) / from),
-    // Calcula out[j0..j1) a partir de toda la entrada x
-    process(x, out, j0, j1) {
-      const n = x.length;
+    // Tramo de la entrada [lo, hi) que hace falta para calcular out[j0..j1) (entrada de `total` muestras)
+    inputRange(j0, j1, total) {
+      const lo = Math.max(0, Math.floor((j0 * from) / to) - half - 1);
+      const hi = Math.min(total, Math.ceil((j1 * from) / to) + half + 2);
+      return [lo, Math.max(lo, hi)];
+    },
+    // Calcula out[j0..j1) a partir de la entrada. Por defecto x es la entrada entera; con xOffset / total, x solo
+    // contiene las muestras [xOffset, xOffset + x.length) de una entrada de `total` muestras (ver inputRange).
+    process(x, out, j0, j1, xOffset = 0, total = x.length) {
+      const n = total;
+      const xo = xOffset;
       for (let j = j0; j < j1; j++) {
         let i0;
         let ph = -1;
@@ -500,8 +508,9 @@ export function createResampler(fromRate, toRate, { zeroCrossings = 12, rolloff 
         const base = i0 - half + 1;
         if (ph >= 0 && base >= 0 && base + taps <= n) {
           const c0 = ph * taps;
+          const b0 = base - xo;
           let acc = 0;
-          for (let k = 0; k < taps; k++) acc += x[base + k] * coef[c0 + k];
+          for (let k = 0; k < taps; k++) acc += x[b0 + k] * coef[c0 + k];
           out[j] = acc;
           continue;
         }
@@ -512,7 +521,7 @@ export function createResampler(fromRate, toRate, { zeroCrossings = 12, rolloff 
         const hi = Math.min(n - 1, i0 + half);
         for (let i = lo; i <= hi; i++) {
           const h = ph >= 0 ? coef[ph * taps + (i - base)] : kernel(i - i0 - frac);
-          acc += x[i] * h;
+          acc += x[i - xo] * h;
           wsum += h;
         }
         out[j] = wsum > 1e-6 ? acc / wsum : 0;
@@ -529,7 +538,28 @@ export function resample(x, fromRate, toRate, opts) {
   return out;
 }
 
-const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+// Cede el hilo principal un momento. Con MessageChannel y no con setTimeout(0): en una pestaña en segundo plano los
+// temporizadores se espacian a ~1 s y la carga o la exportación se arrastrarían.
+let yieldChannel = null;
+const yieldQueue = [];
+export function yieldTask() {
+  if (typeof MessageChannel !== 'function') return new Promise((resolve) => setTimeout(resolve, 0));
+  if (!yieldChannel) {
+    yieldChannel = new MessageChannel();
+    yieldChannel.port1.onmessage = () => {
+      const r = yieldQueue.shift();
+      // en Node, el canal solo mantiene vivo el proceso mientras hay esperas pendientes
+      if (!yieldQueue.length && typeof yieldChannel.port1.unref === 'function') yieldChannel.port1.unref();
+      if (r) r();
+    };
+  }
+  if (typeof yieldChannel.port1.ref === 'function') yieldChannel.port1.ref();
+  return new Promise((resolve) => {
+    yieldQueue.push(resolve);
+    yieldChannel.port2.postMessage(0);
+  });
+}
+const tick = yieldTask;
 
 // Igual que resample() pero por bloques, cediendo el hilo entre bloques (la UI sigue respondiendo)
 export async function resampleAsync(x, fromRate, toRate, { onProgress = null, blockSize = 1 << 18, ...opts } = {}) {
@@ -547,13 +577,82 @@ export async function resampleAsync(x, fromRate, toRate, { onProgress = null, bl
 // ---------- mono para el análisis ----------
 
 export const ANALYSIS_RESAMPLER = { zeroCrossings: 10, rolloff: 0.92 };
+const POLARITY_FLOOR_DB = -30;   // mezcla mono tan por debajo de los canales = canales en contrafase
+
+// Pesos de la mezcla mono para el análisis: el promedio de los canales; si ese promedio casi se anula (estéreo con
+// un canal invertido: R = −L), la diferencia (L − R)/2 o, con más canales, el canal más fuerte.
+export function analysisMixWeights(channels) {
+  const chans = Array.from(channels || []);
+  const nCh = chans.length;
+  if (nCh < 2) return nCh ? [1] : [];
+  let n = Infinity;
+  for (const c of chans) n = Math.min(n, c.length);
+  const k = 1 / nCh;
+  const sq = new Float64Array(nCh);
+  let mix = 0;
+  for (let i = 0; i < n; i++) {
+    let m = 0;
+    for (let c = 0; c < nCh; c++) {
+      const v = chans[c][i];
+      sq[c] += v * v;
+      m += v;
+    }
+    mix += (m * k) * (m * k);
+  }
+  const mean = sq.reduce((a, b) => a + b, 0) / nCh;
+  const avg = new Array(nCh).fill(k);
+  if (!(mean > 0) || mix >= mean * 10 ** (POLARITY_FLOOR_DB / 10)) return avg;
+  if (nCh === 2) return [0.5, -0.5];
+  let best = 0;
+  for (let c = 1; c < nCh; c++) if (sq[c] > sq[best]) best = c;
+  return chans.map((_, c) => (c === best ? 1 : 0));
+}
+
+// Mezcla con pesos de las muestras [i0, i1) en dst (mismo orden de operaciones que downmixMono)
+function mixInto(chans, weights, i0, i1, dst) {
+  const len = i1 - i0;
+  dst.fill(0, 0, len);
+  for (let c = 0; c < chans.length; c++) {
+    const w = weights[c];
+    if (!w) continue;
+    const src = chans[c];
+    for (let i = 0; i < len; i++) dst[i] += src[i0 + i] * w;
+  }
+}
 
 // Mono a `targetRate` (normalmente 22050 Hz) para el análisis. Devuelve un Float32Array nuevo (se puede transferir).
+// Mezcla y remuestrea por bloques: no hace falta una copia mono entera a la frecuencia original (con 10 min a
+// 48 kHz eran 116 MB más durante la carga).
 export async function toAnalysisMono(audioBuffer, targetRate = 22050) {
   const chans = [];
   for (let c = 0; c < audioBuffer.numberOfChannels; c++) chans.push(audioBuffer.getChannelData(c));
-  const mono = downmixMono(chans);
-  if (Math.round(audioBuffer.sampleRate) === Math.round(targetRate)) return mono;
+  let n = Infinity;
+  for (const c of chans) n = Math.min(n, c.length);
+  if (!chans.length || !Number.isFinite(n)) return new Float32Array(0);
+  const weights = analysisMixWeights(chans);
+  const plain = weights.every((w) => w === 1 / chans.length);
+  if (Math.round(audioBuffer.sampleRate) === Math.round(targetRate)) {
+    if (plain) return downmixMono(chans);
+    const mono = new Float32Array(n);
+    mixInto(chans, weights, 0, n, mono);
+    return mono;
+  }
   await tick();
-  return resampleAsync(mono, audioBuffer.sampleRate, targetRate, ANALYSIS_RESAMPLER);
+  const r = createResampler(audioBuffer.sampleRate, targetRate, ANALYSIS_RESAMPLER);
+  const out = new Float32Array(r.outLength(n));
+  const block = 1 << 16;
+  let tmp = new Float32Array(0);
+  let last = Date.now();
+  for (let j0 = 0; j0 < out.length; j0 += block) {
+    const j1 = Math.min(out.length, j0 + block);
+    const [lo, hi] = r.inputRange(j0, j1, n);
+    if (tmp.length < hi - lo) tmp = new Float32Array(hi - lo);
+    mixInto(chans, weights, lo, hi, tmp);
+    r.process(tmp, out, j0, j1, lo, n);
+    if (Date.now() - last > 30 && j1 < out.length) {
+      await tick();
+      last = Date.now();
+    }
+  }
+  return out;
 }

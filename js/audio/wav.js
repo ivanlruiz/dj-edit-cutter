@@ -14,32 +14,32 @@ function writeAscii(view, offset, text) {
   for (let i = 0; i < text.length; i++) view.setUint8(offset + i, text.charCodeAt(i));
 }
 
-export function encodeWav(channels, sampleRate, { bitDepth = 16, id3 = null } = {}) {
-  const chans = Array.from(channels || []);
-  const nCh = chans.length;
+function checkFormat(nCh, sampleRate, bitDepth) {
   if (!nCh) throw new Error('No hay audio para guardar.');
   const sr = Math.round(Number(sampleRate));
   if (!(sr > 0)) throw new Error('Frecuencia de muestreo no válida.');
-  const bits = Number(bitDepth) === 24 ? 24 : 16;
   if (bitDepth != null && Number(bitDepth) !== 16 && Number(bitDepth) !== 24) {
     throw new Error('Profundidad de bits no soportada (usa 16 o 24 bits).');
   }
-  let frames = Infinity;
-  for (const ch of chans) frames = Math.min(frames, ch ? ch.length : 0);
+  return { sr, bits: Number(bitDepth) === 24 ? 24 : 16 };
+}
+
+// Cabecera RIFF/WAVE + fmt + cabecera del chunk 'data' para `frames` muestras por canal; tagLen = bytes del
+// chunk 'id3 ' que irá después de los datos (0 = sin etiqueta). Devuelve { header, dataBytes, total }.
+function wavLayout(nCh, sr, bits, frames, tagLen) {
   const bytesPerSample = bits / 8;
   const blockAlign = nCh * bytesPerSample;
   const dataBytes = frames * blockAlign;
   const extensible = nCh > 2;
   const fmtBytes = extensible ? 40 : 16;
-  const tag = id3 && id3.length ? (id3 instanceof Uint8Array ? id3 : new Uint8Array(id3)) : null;
   const pad = (n) => n & 1;
-  const total = 12 + (8 + fmtBytes) + (8 + dataBytes + pad(dataBytes)) + (tag ? 8 + tag.length + pad(tag.length) : 0);
+  const headerBytes = 12 + (8 + fmtBytes) + 8;
+  const total = headerBytes + dataBytes + pad(dataBytes) + (tagLen ? 8 + tagLen + pad(tagLen) : 0);
   if (total - 8 > MAX_RIFF_BYTES) {
     throw new Error('El archivo WAV superaría el límite de 4 GB. Prueba con MP3 o con 16 bits.');
   }
-
-  const buf = new ArrayBuffer(total);
-  const view = new DataView(buf);
+  const header = new ArrayBuffer(headerBytes);
+  const view = new DataView(header);
   writeAscii(view, 0, 'RIFF');
   view.setUint32(4, total - 8, true);
   writeAscii(view, 8, 'WAVE');
@@ -63,31 +63,88 @@ export function encodeWav(channels, sampleRate, { bitDepth = 16, id3 = null } = 
   }
   writeAscii(view, p, 'data');
   view.setUint32(p + 4, dataBytes, true);
-  const dataOff = p + 8;
+  return { header: new Uint8Array(header), dataBytes, total };
+}
 
-  if (bits === 16) writePcm16(chans, frames, buf, dataOff);
-  else writePcm24(chans, frames, buf, dataOff);
+// Chunk 'id3 ' (con el byte de relleno si hace falta), precedido del relleno del chunk 'data' si era impar
+function tailBytes(dataBytes, tag) {
+  const padData = dataBytes & 1;
+  if (!tag) return padData ? new Uint8Array(1) : null;
+  const out = new Uint8Array(padData + 8 + tag.length + (tag.length & 1));
+  const view = new DataView(out.buffer);
+  writeAscii(view, padData, 'id3 ');
+  view.setUint32(padData + 4, tag.length, true);
+  out.set(tag, padData + 8);
+  return out;
+}
 
-  p = dataOff + dataBytes + pad(dataBytes);   // el byte de relleno ya es 0
-  if (tag) {
-    writeAscii(view, p, 'id3 ');
-    view.setUint32(p + 4, tag.length, true);
-    new Uint8Array(buf, p + 8, tag.length).set(tag);
-  }
+function toTag(id3) {
+  return id3 && id3.length ? (id3 instanceof Uint8Array ? id3 : new Uint8Array(id3)) : null;
+}
+
+export function encodeWav(channels, sampleRate, { bitDepth = 16, id3 = null } = {}) {
+  const chans = Array.from(channels || []);
+  const nCh = chans.length;
+  const { sr, bits } = checkFormat(nCh, sampleRate, bitDepth);
+  let frames = Infinity;
+  for (const ch of chans) frames = Math.min(frames, ch ? ch.length : 0);
+  const tag = toTag(id3);
+  const { header, dataBytes, total } = wavLayout(nCh, sr, bits, frames, tag ? tag.length : 0);
+  const buf = new ArrayBuffer(total);
+  const bytes = new Uint8Array(buf);
+  bytes.set(header, 0);
+  writePcm(chans, 0, frames, bits, bytes.subarray(header.length, header.length + dataBytes), { rng: DITHER_SEED });
+  const tail = tailBytes(dataBytes, tag);
+  if (tail) bytes.set(tail, header.length + dataBytes);
   return buf;
 }
 
-// 16 bits con dither TPDF de ±1 LSB; el silencio digital (0.0 exacto) se mantiene en 0.
-function writePcm16(chans, frames, buf, dataOff) {
+// Igual que encodeWav pero por tramos, sin tener la salida entera ni el WAV en un solo bloque de memoria.
+// source = { length (muestras por canal), numberOfChannels, read(s0, s1) → Float32Array[] del tramo }.
+// Mismos bytes que encodeWav sobre la salida completa. Cede el hilo entre tramos (onProgress 0..1).
+export async function encodeWavBlob(source, sampleRate, {
+  bitDepth = 16, id3 = null, onProgress = null, chunkFrames = 1 << 19, yieldFn = null,
+} = {}) {
+  const nCh = source ? source.numberOfChannels : 0;
+  const { sr, bits } = checkFormat(nCh, sampleRate, bitDepth);
+  const frames = Math.max(0, Math.floor(source.length) || 0);
+  const tag = toTag(id3);
+  const { header, dataBytes } = wavLayout(nCh, sr, bits, frames, tag ? tag.length : 0);
+  const parts = [header];
+  const state = { rng: DITHER_SEED };
+  const step = Math.max(1, Math.floor(chunkFrames));
+  for (let a = 0; a < frames; a += step) {
+    const b = Math.min(frames, a + step);
+    const chans = source.read(a, b);
+    const pcm = new Uint8Array((b - a) * nCh * (bits / 8));
+    writePcm(chans, 0, b - a, bits, pcm, state);
+    parts.push(pcm);
+    if (onProgress) onProgress(b / frames);
+    if (b < frames && yieldFn) await yieldFn();
+  }
+  const tail = tailBytes(dataBytes, tag);
+  if (tail) parts.push(tail);
+  return new Blob(parts, { type: 'audio/wav' });
+}
+
+const DITHER_SEED = 0x9e3779b9;
+
+// Muestras [from, from + frames) de cada canal → PCM entrelazado little-endian en dst (Uint8Array).
+// 16 bits: dither TPDF de ±1 LSB (xorshift32; state.rng sigue entre tramos) y el silencio digital (0.0) queda en 0.
+function writePcm(chans, from, frames, bits, dst, state) {
+  if (bits === 16) state.rng = writePcm16(chans, from, frames, dst, state.rng);
+  else writePcm24(chans, from, frames, dst);
+}
+
+function writePcm16(chans, from, frames, dst, seed) {
   const nCh = chans.length;
-  const aligned = LITTLE_ENDIAN && (dataOff % 2 === 0);
-  const out = aligned ? new Int16Array(buf, dataOff, frames * nCh) : null;
-  const view = aligned ? null : new DataView(buf);
-  let s = 0x9e3779b9;   // xorshift32 en línea (más rápido que un cierre por muestra)
-  for (let c = 0; c < nCh; c++) {
-    const src = chans[c];
-    for (let i = 0, k = c; i < frames; i++, k += nCh) {
-      const x = src[i];
+  const aligned = LITTLE_ENDIAN && (dst.byteOffset % 2 === 0);
+  const out = aligned ? new Int16Array(dst.buffer, dst.byteOffset, frames * nCh) : null;
+  const view = aligned ? null : new DataView(dst.buffer, dst.byteOffset, dst.byteLength);
+  let s = seed;
+  for (let i = 0, k = 0; i < frames; i++) {
+    for (let c = 0; c < nCh; c++, k++) {
+      const x = chans[c][from + i];
       let v = 0;
       if (x !== 0) {
         s ^= s << 13; s ^= s >>> 17; s ^= s << 5;
@@ -101,19 +158,19 @@ function writePcm16(chans, frames, buf, dataOff) {
         v = y >= 0 ? (y + 0.5) | 0 : -((0.5 - y) | 0);
       }
       if (out) out[k] = v;
-      else view.setInt16(dataOff + 2 * k, v, true);
+      else view.setInt16(2 * k, v, true);
     }
   }
+  return s;
 }
 
-function writePcm24(chans, frames, buf, dataOff) {
+function writePcm24(chans, from, frames, bytes) {
   const nCh = chans.length;
-  const bytes = new Uint8Array(buf, dataOff, frames * nCh * 3);
   const stride = 3 * nCh;
   for (let c = 0; c < nCh; c++) {
     const src = chans[c];
     for (let i = 0, o = 3 * c; i < frames; i++, o += stride) {
-      let y = src[i] * 8388608;
+      let y = src[from + i] * 8388608;
       if (y > 8388607) y = 8388607;
       else if (y < -8388608) y = -8388608;
       else if (y !== y) y = 0;

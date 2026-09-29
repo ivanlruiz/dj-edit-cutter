@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { encodeWav, parseWav } from '../js/audio/wav.js';
+import { encodeWav, encodeWavBlob, parseWav } from '../js/audio/wav.js';
 import { readId3v2 } from '../js/audio/id3.js';
 
 function noise(n, seed = 1, amp = 0.9) {
@@ -166,4 +166,35 @@ test('parseWav lee también float32 y 8 bits', () => {
   const r = parseWav(buf);
   assert.deepEqual(Array.from(r.channels[0]), [0.5, 1]);
   assert.deepEqual(Array.from(r.channels[1]), [-0.25, 0]);
+});
+
+test('encodeWavBlob: por tramos da exactamente los mismos bytes que encodeWav (sin la salida entera en memoria)', async () => {
+  const tag = new Uint8Array([0x49, 0x44, 0x33, 3, 0, 0, 0, 0, 0, 1, 7]);
+  for (const nCh of [1, 2, 6]) {
+    const chans = Array.from({ length: nCh }, (_, c) => noise(12345, 50 + c));
+    chans[0].fill(0, 100, 300);                       // silencio digital en medio
+    for (const bitDepth of [16, 24]) {
+      for (const id3 of [null, tag]) {
+        const ref = new Uint8Array(encodeWav(chans, 44100, { bitDepth, id3 }));
+        for (const chunkFrames of [1000, 4096, 1 << 20]) {
+          const reads = [];
+          const source = {
+            length: 12345, numberOfChannels: nCh,
+            read: (a, b) => { reads.push([a, b]); return chans.map((ch) => ch.slice(a, b)); },
+          };
+          const progress = [];
+          let yields = 0;
+          const blob = await encodeWavBlob(source, 44100, {
+            bitDepth, id3, chunkFrames, onProgress: (f) => progress.push(f), yieldFn: async () => { yields++; },
+          });
+          assert.equal(blob.type, 'audio/wav');
+          const got = new Uint8Array(await blob.arrayBuffer());
+          assert.deepEqual(got, ref, `${nCh} canales, ${bitDepth} bits, id3 ${!!id3}, tramos de ${chunkFrames}`);
+          assert.ok(reads.every(([a, b]) => b - a <= chunkFrames), 'nunca pide más de un tramo');
+          assert.equal(progress[progress.length - 1], 1);
+          assert.equal(yields, reads.length - 1);
+        }
+      }
+    }
+  }
 });

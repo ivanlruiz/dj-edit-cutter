@@ -1,6 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { buildPeakPyramid, pickLevel, snapToBeat, clampView, zoomView, PEAK_BLOCK } from '../js/ui/waveform.js';
+import {
+  buildPeakPyramid, pickLevel, snapToBeat, clampView, zoomView, PEAK_BLOCK, visibleSlices, firstSliceEndingAfter,
+  classifyTapMove, cutPillX, PILL_W,
+} from '../js/ui/waveform.js';
 
 test('buildPeakPyramid: min/max/rms por bloque y niveles que se reducen a la mitad', () => {
   const n = PEAK_BLOCK * 5 + 10;
@@ -61,4 +64,35 @@ test('clampView y zoomView mantienen la vista dentro de la canción', () => {
   assert.ok(Math.abs((30 - v.start) / (v.end - v.start) - 0.75) < 1e-9);
   const out = zoomView({ start: 50, end: 60 }, 100, 55, 100);
   assert.deepEqual(out, { start: 0, end: 100 });
+});
+
+test('visibleSlices: solo los trozos del cambio de compás que se ven (búsqueda binaria)', () => {
+  const slices = [];
+  for (let i = 0; i < 300; i++) slices.push({ start: i * 2 + 1.7, end: i * 2 + 1.95 });
+  assert.equal(firstSliceEndingAfter(slices, 0), 0);
+  assert.equal(firstSliceEndingAfter(slices, 1.95), 1);
+  assert.equal(firstSliceEndingAfter(slices, 1.9), 0);
+  assert.equal(firstSliceEndingAfter(slices, 1e9), 300);
+  assert.deepEqual(visibleSlices(slices, 10, 20), [5, 10]);   // 11.7–11.95 … 19.7–19.95
+  assert.deepEqual(visibleSlices(slices, 9.8, 9.9), [4, 5]);  // dentro de un trozo
+  assert.deepEqual(visibleSlices(slices, 9.96, 11.69), [5, 5]);
+  assert.deepEqual(visibleSlices(slices, -5, 1e9), [0, 300]);
+  assert.deepEqual(visibleSlices([], 0, 10), [0, 0]);
+  assert.deepEqual(visibleSlices(null, 0, 10), [0, 0]);
+});
+
+test('classifyTapMove: vertical = desplazar la página (sin salto del cabezal), horizontal = paneo', () => {
+  assert.equal(classifyTapMove(0, 0), 'tap');
+  assert.equal(classifyTapMove(3, -5), 'tap');          // temblor del dedo: sigue siendo un toque
+  assert.equal(classifyTapMove(2, -40), 'cancel');      // swipe vertical: ni paneo ni seek
+  assert.equal(classifyTapMove(-4, 9), 'cancel');
+  assert.equal(classifyTapMove(-20, 3), 'pan');
+  assert.equal(classifyTapMove(10, 9), 'pan');          // diagonal más horizontal que vertical
+  assert.equal(classifyTapMove(7, 30), 'cancel');       // diagonal más vertical: la página
+});
+
+test('cutPillX: la etiqueta CORTE va a la derecha de la línea (no tapa el último compás que queda)', () => {
+  assert.equal(cutPillX(300, 800), 299);                  // a la derecha: empieza en la línea
+  assert.equal(cutPillX(790, 800), 790 - PILL_W + 1);     // sin sitio a la derecha: a la izquierda
+  assert.equal(cutPillX(10, 30), 0);                      // nunca fuera del lienzo
 });

@@ -14,19 +14,29 @@
 // @property {number} peak         pico absoluto de la entrada (la señal se normaliza a pico 1 antes del espectro)
 // @property {Float32Array} onset  flujo espectral tipo SuperFlux (≥ 0), dividido por su percentil 99:
 //                                 ~1 % de las tramas supera 1; golpes fuertes ≈ 1–3, ruido de fondo ≈ 0.01–0.05
-//                                 (≈ 0.2–0.4 en material sostenido: pads, cuerdas)
+//                                 (≈ 0.2–0.4 en material sostenido: pads, cuerdas). Vale 0 en las tramas cuya ventana
+//                                 (o la de su referencia) cruza un extremo del archivo: el relleno de ceros no es un onset.
 // @property {Float32Array} onsetLow  lo mismo sólo con bandas < 200 Hz (bombo/bajo), dividido por SU percentil 99
 // @property {number} onsetScale      divisor aplicado a onset (unidades brutas: suma de log10 por banda)
 // @property {number} onsetLowScale   divisor aplicado a onsetLow (compara onsetLow*onsetLowScale con onset*onsetScale)
 // @property {number} numBands, numLowBands   bandas del banco log-frecuencia (≈125) y cuántas son < 200 Hz
+// @property {number} firstValidFrame, lastValidFrame  tramas con la ventana (y la referencia) dentro del archivo
 // @property {Float32Array} chroma numFrames*12, fila i = chroma[i*12 .. i*12+11] (clase 0 = Do, 9 = La);
 //                                 máximo de cada trama = 1 (0 en tramas a < -60 dB de la más fuerte);
 //                                 calculado con ventana de 2048 y salto hop*4, interpolado linealmente a cada trama
 // @property {Float32Array} rms    RMS por trama sin ventana sobre [i*hop - frameSize/2, i*hop + frameSize/2),
-//                                 en la escala ORIGINAL de la señal (no normalizada)
+//                                 en la escala ORIGINAL de la señal (no normalizada) y SIN componente continua: es la
+//                                 desviación típica de las muestras de la trama (las de fuera del archivo no cuentan)
+// @property {Float32Array} rmsHigh   RMS de la banda >= highCutoff (2 kHz) por trama, del espectro con ventana de Hann
+//                                 (Parseval), en la escala original: los ataques la hacen subir aunque un limitador
+//                                 deje el nivel total plano (masters de la "guerra del volumen")
+// @property {Float32Array} flatness  planitud espectral (media geométrica / aritmética, 0..1) del espectro de potencia
+//                                 PROMEDIADO en flatnessSec (centrado) entre flatnessFmin y flatnessFmax: ≈ 0.8–0.9 en
+//                                 ruido de banda ancha (aplausos, público), ≈ 0.01–0.3 en música con notas; 0 en silencio.
+//                                 Calculada cada flatnessStep tramas e interpolada
 import { getRealFFT, hannWindow } from './fft.js';
 
-export const FEATURES_VERSION = 1;
+export const FEATURES_VERSION = 2;
 
 export const FEATURE_DEFAULTS = {
   frameSize: 1024, // ~46 ms a 22050 Hz
@@ -46,6 +56,12 @@ export const FEATURE_DEFAULTS = {
   normQuantile: 0.99, // onset y onsetLow se dividen por este cuantil
   whitenTau: 1, // s; >0 activa el blanqueo por banda de la diferencia (atenúa bandas que fluctúan siempre)
   whitenFloor: 0.02, // unidades log10: fluctuación típica por debajo de esto no atenúa
+  highCutoff: 2000, // Hz: banda de rmsHigh
+  flatnessFmin: 300, // Hz: banda de la planitud espectral (flatness)
+  flatnessFmax: 5000,
+  flatnessSec: 0.25, // s: promedio del espectro de potencia antes de medir la planitud
+  flatnessStep: 4, // tramas entre cálculos de la planitud (se interpola entre ellos)
+  onProgress: null, // (fraction 0..1) => void, como mucho cada ~1 % del trabajo
 };
 
 /** Filtros triangulares log-frecuencia con bins únicos (estilo madmom), normalizados en área. */
@@ -107,7 +123,8 @@ function quantile(arr, q) {
  * Calcula las características de una señal mono.
  * @param {Float32Array} samples mono
  * @param {number} sampleRate normalmente 22050
- * @param {object} [opts] ver FEATURE_DEFAULTS (los valores por defecto son los evaluados en el benchmark)
+ * @param {object} [opts] ver FEATURE_DEFAULTS (los valores por defecto son los evaluados en el benchmark);
+ *   opts.onProgress(fraction) informa del avance (0..1, como mucho cada ~1 %; un fallo en el callback se ignora)
  * @returns {Features} ver el typedef al principio del archivo
  */
 export function computeFeatures(samples, sampleRate, opts = {}) {
@@ -116,6 +133,7 @@ export function computeFeatures(samples, sampleRate, opts = {}) {
   const n = samples.length;
   const numFrames = Math.floor(n / hop) + 1;
   const half = frameSize / 2;
+  const progress = progressFn(o.onProgress);
 
   // normalización de nivel: la compresión log no depende del volumen de la grabación
   let peak = 0;
@@ -137,7 +155,8 @@ export function computeFeatures(samples, sampleRate, opts = {}) {
   const onset = new Float32Array(numFrames);
   const onsetLow = new Float32Array(numFrames);
   const rms = new Float32Array(numFrames);
-  // anillo de espectros log filtrados (sólo lag+1 tramas en memoria)
+  const rmsHigh = new Float32Array(numFrames);
+  // anillo de espectros log filtrados (sólo lag+refFrames tramas en memoria)
   const refFrames = Math.max(1, o.refFrames | 0);
   const R = lag + refFrames;
   const ring = Array.from({ length: R }, () => new Float32Array(nb));
@@ -149,6 +168,10 @@ export function computeFeatures(samples, sampleRate, opts = {}) {
   const wFloor = o.whitenFloor;
   const wA = wTau > 0 ? Math.exp(-hop / sampleRate / wTau) : 0;
   const fluct = new Float32Array(nb);
+  // tramas con la ventana entera dentro del archivo (y, para el flujo, también la de la trama de referencia i − lag)
+  const firstValid = Math.ceil(half / hop);
+  const lastValid = Math.floor((n - half) / hop);
+  const fluxFrom = firstValid + lag;
 
   // banco de filtros aplanado (acceso rápido)
   const fbStart = new Int32Array(nb);
@@ -166,28 +189,80 @@ export function computeFeatures(samples, sampleRate, opts = {}) {
   const LOG10E = Math.LOG10E;
   const re = fft.re;
   const im = fft.im;
+  // rmsHigh: bins >= highCutoff; energía de la trama con ventana → media cuadrática sin ventana (Parseval, Σw² = 3N/8)
+  const kHigh = Math.min(half, Math.max(1, Math.ceil((o.highCutoff * frameSize) / sampleRate)));
+  let winSq = 0;
+  for (let k = 0; k < frameSize; k++) winSq += win[k] * win[k];
+  const highScale = 2 / (frameSize * winSq * gain * gain);
+  const progStep = Math.max(1, Math.floor(numFrames / 100));
+  // planitud: anillo con el espectro de potencia (bins fb0..fb1) de las últimas fA tramas y su suma por bin
+  const fb0 = Math.max(1, Math.round((o.flatnessFmin * frameSize) / sampleRate));
+  const fb1 = Math.min(half, Math.max(fb0, Math.round((o.flatnessFmax * frameSize) / sampleRate)));
+  const fnb = fb1 - fb0 + 1;
+  const fA = Math.max(1, Math.round((o.flatnessSec * sampleRate) / hop));
+  const fStep = Math.max(1, o.flatnessStep | 0);
+  const fRing = new Float32Array(fA * fnb);
+  const fSum = new Float64Array(fnb);
+  const flatAt = []; // [trama central, planitud] cada fStep tramas
 
   for (let i = 0; i < numFrames; i++) {
     const c = i * hop;
     const s0 = c - half;
     let sq = 0;
+    let sm = 0;
+    let cnt = frameSize;
     if (s0 >= 0 && s0 + frameSize <= n) {
       for (let k = 0; k < frameSize; k++) {
         const v = samples[s0 + k];
         sq += v * v;
+        sm += v;
         frame[k] = v * gain * win[k];
       }
     } else {
+      cnt = 0;
       for (let k = 0; k < frameSize; k++) {
         const idx = s0 + k;
         const v = idx >= 0 && idx < n ? samples[idx] : 0;
+        if (idx >= 0 && idx < n) cnt++;
         sq += v * v;
+        sm += v;
         frame[k] = v * gain * win[k];
       }
     }
-    rms[i] = Math.sqrt(sq / frameSize);
+    // rms sin componente continua: Σ(v − media)² = Σv² − (Σv)²/cnt (sólo muestras del archivo; 46 ms: no se come
+    // los graves). Nunca supera al RMS con DC, y en silencio es 0 aunque haya música cerca.
+    rms[i] = cnt > 0 ? Math.sqrt(Math.max(0, sq - (sm * sm) / cnt) / frameSize) : 0;
     fft.forward(frame);
-    for (let k = 0; k <= half; k++) mag[k] = Math.sqrt(re[k] * re[k] + im[k] * im[k]);
+    let hi = 0;
+    for (let k = 0; k <= half; k++) {
+      const p = re[k] * re[k] + im[k] * im[k];
+      mag[k] = Math.sqrt(p);
+      if (k >= kHigh) hi += k === half ? 0.5 * p : p;
+    }
+    rmsHigh[i] = Math.sqrt(hi * highScale);
+    const slot = (i % fA) * fnb;
+    for (let k = fb0; k <= fb1; k++) {
+      const p = re[k] * re[k] + im[k] * im[k];
+      fSum[k - fb0] += p - fRing[slot + k - fb0];
+      fRing[slot + k - fb0] = p;
+    }
+    if (i % fA === fA - 1) {
+      // suma exacta de vez en cuando (sin deriva de redondeo en los silencios)
+      fSum.fill(0);
+      for (let q = 0; q < fA * fnb; q += fnb) for (let k = 0; k < fnb; k++) fSum[k] += fRing[q + k];
+    }
+    if (i % fStep === 0 || i === numFrames - 1) {
+      const cnt = Math.min(i + 1, fA);
+      let lg = 0;
+      let ar = 0;
+      for (let k = 0; k < fnb; k++) {
+        const v = Math.max(0, fSum[k]) / cnt;
+        ar += v;
+        lg += Math.log(v + 1e-30);
+      }
+      ar /= fnb;
+      flatAt.push(i - (cnt - 1) / 2, ar > 1e-14 ? Math.min(1, Math.exp(lg / fnb) / ar) : 0);
+    }
     const cur = ring[i % R];
     for (let f = 0; f < nb; f++) {
       let s = 0;
@@ -233,11 +308,16 @@ export function computeFeatures(samples, sampleRate, opts = {}) {
           if (f < nLow) sumLow += d;
         }
       }
-      onset[i] = sum;
-      onsetLow[i] = sumLow;
+      // en los bordes el relleno de ceros (y el corte de la ventana) produce flujo que no es un onset
+      if (i >= fluxFrom && i <= lastValid) {
+        onset[i] = sum;
+        onsetLow[i] = sumLow;
+      }
     }
+    if (i % progStep === 0) progress((0.8 * i) / numFrames);
   }
 
+  const flatness = interpolateAt(flatAt, numFrames);
   const onsetScale = Math.max(1e-9, quantile(onset, o.normQuantile));
   const onsetLowScale = Math.max(1e-9, quantile(onsetLow, o.normQuantile));
   for (let i = 0; i < numFrames; i++) {
@@ -245,7 +325,8 @@ export function computeFeatures(samples, sampleRate, opts = {}) {
     onsetLow[i] /= onsetLowScale;
   }
 
-  const chroma = computeChroma(samples, sampleRate, gain, numFrames, o);
+  const chroma = computeChroma(samples, sampleRate, gain, numFrames, o, (f) => progress(0.8 + 0.2 * f));
+  progress(1);
 
   return {
     version: FEATURES_VERSION,
@@ -262,13 +343,52 @@ export function computeFeatures(samples, sampleRate, opts = {}) {
     onsetLowScale,
     numBands: nb,
     numLowBands: nLow,
+    firstValidFrame: Math.min(numFrames - 1, fluxFrom),
+    lastValidFrame: Math.max(0, lastValid),
     chroma,
     rms,
+    rmsHigh,
+    flatness,
+  };
+}
+
+/** Interpola linealmente pares [x0, y0, x1, y1, ...] (x crecientes) a las tramas 0..n-1 (extremos constantes). */
+function interpolateAt(pairs, n) {
+  const out = new Float32Array(n);
+  const m = pairs.length / 2;
+  if (!m) return out;
+  let j = 0;
+  for (let i = 0; i < n; i++) {
+    while (j + 1 < m && pairs[2 * (j + 1)] <= i) j++;
+    const x0 = pairs[2 * j];
+    const y0 = pairs[2 * j + 1];
+    if (i <= x0 || j + 1 >= m) out[i] = y0;
+    else {
+      const x1 = pairs[2 * (j + 1)];
+      out[i] = y0 + ((pairs[2 * (j + 1) + 1] - y0) * (i - x0)) / (x1 - x0);
+    }
+  }
+  return out;
+}
+
+/** Envuelve un callback de progreso: fracciones crecientes en [0, 1], errores del callback ignorados. */
+function progressFn(cb) {
+  if (typeof cb !== 'function') return () => {};
+  let last = -1;
+  return (f) => {
+    const v = Math.min(1, Math.max(0, f));
+    if (v <= last) return;
+    last = v;
+    try {
+      cb(v);
+    } catch {
+      // un fallo en la interfaz no debe parar el análisis
+    }
   };
 }
 
 /** Croma a salto hop*chromaHopFactor con ventana larga, interpolado linealmente a la rejilla de tramas. */
-function computeChroma(samples, sampleRate, gain, numFrames, o) {
+function computeChroma(samples, sampleRate, gain, numFrames, o, progress = () => {}) {
   const N = o.chromaFrameSize;
   const hopC = o.hop * o.chromaHopFactor;
   const n = samples.length;
@@ -279,18 +399,24 @@ function computeChroma(samples, sampleRate, gain, numFrames, o) {
   const map = buildChromaMap(N, sampleRate, o.chromaFmin, o.chromaFmax);
   const cC = new Float32Array(nC * 12);
   const energy = new Float32Array(nC);
+  const acc = new Float64Array(12);
   const half = N / 2;
+  const progStep = Math.max(1, Math.floor(nC / 25));
   let maxE = 0;
   for (let j = 0; j < nC; j++) {
     const s0 = j * hopC - half;
-    for (let k = 0; k < N; k++) {
-      const idx = s0 + k;
-      frame[k] = idx >= 0 && idx < n ? samples[idx] * gain * win[k] : 0;
+    if (s0 >= 0 && s0 + N <= n) {
+      for (let k = 0; k < N; k++) frame[k] = samples[s0 + k] * gain * win[k];
+    } else {
+      for (let k = 0; k < N; k++) {
+        const idx = s0 + k;
+        frame[k] = idx >= 0 && idx < n ? samples[idx] * gain * win[k] : 0;
+      }
     }
     fft.forward(frame);
     const re = fft.re;
     const im = fft.im;
-    const acc = new Float64Array(12);
+    acc.fill(0);
     let e = 0;
     for (let b = map.b0; b <= map.b1; b++) {
       const m = Math.sqrt(re[b] * re[b] + im[b] * im[b]);
@@ -303,6 +429,7 @@ function computeChroma(samples, sampleRate, gain, numFrames, o) {
     let mx = 0;
     for (let p = 0; p < 12; p++) if (acc[p] > mx) mx = acc[p];
     if (mx > 0) for (let p = 0; p < 12; p++) cC[j * 12 + p] = acc[p] / mx;
+    if (j % progStep === 0) progress(j / nC);
   }
   // tramas prácticamente silenciosas (< -60 dB de la más fuerte) => croma 0
   const th = maxE * 1e-3;

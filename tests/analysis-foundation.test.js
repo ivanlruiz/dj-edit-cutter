@@ -12,6 +12,8 @@ import { generateSong } from './synth/generate.js';
 import { SUITE, CASE_NAMES, getCase } from './synth/suite.js';
 import { encodeWavFile, decodeWav, toMono } from './synth/wav-io.js';
 import { Rng } from './synth/prng.js';
+import { brickwallLimit, hardClip, MASTERING_VARIANTS } from './synth/mastering.js';
+import { SETS } from './synth/sets.js';
 
 const SR = 22050;
 
@@ -158,6 +160,88 @@ test('tempo: bpmHint + strict restringe a [0.8, 1.25] × hint', () => {
   assert.ok(half.bpm >= 48 && half.bpm <= 75, `hint 60 -> ${half.bpm}`);
   const dbl = estimateTempo(f, { bpmHint: 240, strict: true, maxBpm: 300 });
   assert.ok(Math.abs(dbl.bpm / 240 - 1) < 0.05, `hint 240 -> ${dbl.bpm}`);
+});
+
+test('features: rms sin componente continua (offset DC) y rmsHigh sólo con la banda > 2 kHz', () => {
+  const n = 3 * SR;
+  const tone = (hz, amp) => Float32Array.from({ length: n }, (_, i) => amp * Math.sin((2 * Math.PI * hz * i) / SR));
+  const lowTone = tone(220, 0.5);
+  const a = computeFeatures(lowTone, SR);
+  const b = computeFeatures(Float32Array.from(lowTone, (v) => v + 0.3), SR);
+  for (const i of [20, 100, 200]) assert.ok(Math.abs(b.rms[i] / a.rms[i] - 1) < 0.01, `trama ${i}: ${b.rms[i]} vs ${a.rms[i]}`);
+  assert.ok(Math.abs(a.rms[100] - 0.5 / Math.SQRT2) < 0.01, 'RMS de un seno');
+  const dc = computeFeatures(new Float32Array(n).fill(0.4), SR);
+  assert.ok(Math.max(...dc.rms) < 1e-4, 'sólo DC: rms 0');
+  assert.ok(dc.rmsHigh instanceof Float32Array && dc.rmsHigh.length === dc.numFrames);
+  // un tono de 5 kHz está entero en la banda alta; uno de 220 Hz no
+  const hi = computeFeatures(tone(5000, 0.5), SR);
+  assert.ok(Math.abs(hi.rmsHigh[100] / hi.rms[100] - 1) < 0.05, `5 kHz: ${hi.rmsHigh[100]} vs ${hi.rms[100]}`);
+  assert.ok(a.rmsHigh[100] < 0.01 * a.rms[100], `220 Hz: ${a.rmsHigh[100]}`);
+});
+
+test('features: sin flujo espurio en las tramas cuya ventana cruza los extremos del archivo', () => {
+  // música desde la primera muestra hasta la última, con offset DC y sin silencio en los bordes
+  const n = 4 * SR;
+  const x = new Float32Array(n);
+  for (let i = 0; i < n; i++) x[i] = 0.35 + 0.3 * Math.sin((2 * Math.PI * 330 * i) / SR) + 0.1 * Math.sin((2 * Math.PI * 97 * i) / SR);
+  const f = computeFeatures(x, SR);
+  assert.ok(f.firstValidFrame >= 2 && f.lastValidFrame < f.numFrames - 1);
+  for (let i = 0; i < f.firstValidFrame; i++) assert.equal(f.onset[i], 0, `trama ${i}`);
+  for (let i = f.lastValidFrame + 1; i < f.numFrames; i++) assert.equal(f.onset[i], 0, `trama ${i}`);
+  // junto a los bordes el flujo no supera al del interior (un tono estable: sólo ruido numérico)
+  const interior = Math.max(...f.onset.subarray(20, f.numFrames - 20));
+  const nearEdges = Math.max(...f.onset.subarray(f.firstValidFrame, f.firstValidFrame + 4), ...f.onset.subarray(f.lastValidFrame - 3, f.lastValidFrame + 1));
+  assert.ok(nearEdges <= interior + 1e-6, `bordes ${nearEdges} vs interior ${interior}`);
+});
+
+test('findMusicBounds: un offset DC no cuenta como música (ni al principio ni en la cola)', () => {
+  const x = new Float32Array(SR * 5);
+  for (let i = SR; i < 3 * SR; i++) x[i] = 0.5 * Math.sin((2 * Math.PI * 220 * i) / SR);
+  const clean = findMusicBounds(x, SR);
+  const d = findMusicBounds(Float32Array.from(x, (v) => v + 0.2), SR);
+  assert.ok(Math.abs(d.musicStart - clean.musicStart) < 0.02 && Math.abs(d.musicEnd - clean.musicEnd) < 0.02, `${d.musicStart} ${d.musicEnd}`);
+  const onlyDc = findMusicBounds(new Float32Array(SR).fill(0.5), SR);
+  assert.equal(onlyDc.musicEnd, 0);
+});
+
+test('findLastOnset: golpe final en un master muy limitado (el nivel total no sube, los agudos sí)', () => {
+  // clics con un "platillo" (ruido agudo) en el golpe final; después, limitador a −12 dB con compensación
+  const hits = grid(0.5, 0.5, 8);
+  const x = clickTrain(hits, 12, { amp: 0.9 });
+  const rng = new Rng(21);
+  const t0 = Math.round(8 * SR);
+  let lp = 0;
+  for (let i = 0; t0 + i < x.length; i++) {
+    const e = Math.exp(-i / (0.8 * SR));
+    const w = rng.next() * 2 - 1;
+    lp += 0.2 * (w - lp);
+    x[t0 + i] += 0.5 * e * Math.sin((2 * Math.PI * 82 * i) / SR) + 0.4 * e * (w - lp);
+  }
+  for (const y of [x, brickwallLimit(x, SR, { thresholdDb: -12 }), hardClip(x, 8)]) {
+    const f = computeFeatures(y, SR);
+    const b = findMusicBounds(y, SR);
+    const lo = findLastOnset(f, b.musicEnd);
+    assert.ok(Math.abs(lo - 8) <= 2 / f.fps, `último onset ${lo}`);
+  }
+});
+
+test('mastering: limitador brick-wall (techo, envolvente aplastada) y recorte duro; variantes con nombre', () => {
+  const x = clickTrain(grid(0.2, 0.25, 3.8), 4, { amp: 0.9 });
+  for (let i = 0; i < x.length; i++) x[i] += 0.02 * Math.sin((2 * Math.PI * 200 * i) / SR);
+  const lim = brickwallLimit(x, SR, { thresholdDb: -12, ceilingDb: -0.3 });
+  let peak = 0;
+  for (const v of lim) peak = Math.max(peak, Math.abs(v));
+  assert.ok(peak <= Math.pow(10, -0.3 / 20) + 1e-6, `pico ${peak}`);
+  assert.equal(lim.length, x.length);
+  const clip = hardClip(x, 8);
+  assert.ok(clip.every((v) => v >= -1 && v <= 1));
+  assert.ok(clip.filter((v) => Math.abs(v) === 1).length > 100, 'hay muestras recortadas');
+  assert.deepEqual(Object.keys(MASTERING_VARIANTS), ['limit12', 'clip4', 'clip8']);
+  for (const v of Object.values(MASTERING_VARIANTS)) assert.equal(v.apply(x, SR).length, x.length);
+  // conjuntos extra: nombres únicos y distintos de la suite
+  const names = [...SETS.stress, ...SETS.extra].map((c) => c.name);
+  assert.equal(new Set(names).size, names.length);
+  assert.ok(names.every((nm) => !CASE_NAMES.includes(nm)));
 });
 
 // ---------------------------------------------------------------- límites

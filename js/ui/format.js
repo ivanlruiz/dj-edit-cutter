@@ -33,13 +33,13 @@ export function overallProgress(stage, fraction) {
   return span[0] + (span[1] - span[0]) * f;
 }
 
-// Número con decimales solo si hacen falta: 2 → "2", 2.5 → "2.5"
+// Número con decimales solo si hacen falta y coma decimal (como en el nombre del archivo): 2 → "2", 2.5 → "2,5"
 export function formatNumber(x, maxDecimals = 1) {
   if (!Number.isFinite(x)) return '–';
   const f = 10 ** maxDecimals;
   const r = Math.round(x * f) / f;
   if (Number.isInteger(r)) return String(r);
-  return r.toFixed(maxDecimals).replace(/0+$/, '');
+  return r.toFixed(maxDecimals).replace(/0+$/, '').replace('.', ',');
 }
 
 // "3:41.25" (m:ss.cc); con horas "1:03:41.25"
@@ -78,7 +78,7 @@ export function formatBpm(bpm, range) {
   return text;
 }
 
-// "1 compás" / "4 compases" / "2.5 compases"
+// "1 compás" / "4 compases" / "2,5 compases"
 export function formatBars(n) {
   const s = formatNumber(n, 1);
   return s === '1' ? '1 compás' : `${s} compases`;
@@ -90,11 +90,11 @@ export function formatBeats(n) {
   return s === '1' ? '1 beat' : `${s} beats`;
 }
 
-// Segundos cortos para el fade: "0.97 s", "12.4 s"
+// Segundos cortos para el fade: "0,97 s", "12,4 s"
 export function formatSeconds(sec) {
   if (!Number.isFinite(sec)) return '– s';
   const a = Math.abs(sec);
-  return `${a < 10 ? sec.toFixed(2) : sec.toFixed(1)} s`;
+  return `${(a < 10 ? sec.toFixed(2) : sec.toFixed(1)).replace('.', ',')} s`;
 }
 
 export function meterText(beatsPerBar) {
@@ -162,18 +162,53 @@ export function fadeBeatsToSeconds(fadeBeats, beats, cutTime, bpm) {
   return fadeBeats * medianBeatInterval(beats, cutTime, 8, bpm);
 }
 
-// Confianza → nivel y texto de la insignia
-export function confidenceInfo(conf) {
+export const END_HIT_TOLERANCE = 0.08;   // s: el golpe final "cae" en un beat si está a menos de esto
+
+// Coherencia del final: ¿el golpe final (lastOnset) cae en un "1" de la cuadrícula, en el último tiempo de un compás
+// (final seco) o es una anticipación (entre el último tiempo y el "1" siguiente)? Si cae en un tiempo interior o a
+// contratiempo, lo más probable es que la cuadrícula esté mal (tempo ×2/÷2, el "1" corrido, compás equivocado…) y el
+// corte de "N compases" también. Medido en el banco (suite + stress + extra × none/limit12/applause, 192 casos):
+// avisa en 15 de 16 cortes de 1 compás incorrectos (antes 14) y en 17 de 176 correctos (antes 13; fade outs sobre todo).
+// → { ok: true | false | null (no se puede evaluar), beat, position, offsetMs }
+export function endConsistency(result) {
+  const r = result || {};
+  const beats = r.beats;
+  const pos = r.positions;
+  const bpb = r.beatsPerBar;
+  if (!beats || beats.length < 4 || !pos || pos.length < beats.length || !Number.isFinite(r.lastOnset) || !(bpb > 1)) {
+    return { ok: null };
+  }
+  const j = nearestIndex(beats, r.lastOnset);
+  const d = beats[j] - r.lastOnset;   // > 0: el beat va después del golpe
+  const p = pos[j];
+  const onBeat = Math.abs(d) < END_HIT_TOLERANCE;
+  // en el "1"; o en el último tiempo (final seco en el 4); o anticipado entre el último tiempo y el "1"
+  const onOne = p === 0 && onBeat;
+  const onLast = p >= bpb - 1 && onBeat;
+  const anticipation = (p >= bpb - 1 && d < -END_HIT_TOLERANCE) || (p === 0 && d > END_HIT_TOLERANCE);
+  return { ok: onOne || onLast || anticipation, beat: j, position: p, offsetMs: Math.round(-d * 1000) };
+}
+
+// Confianza → nivel y texto de la insignia. Con el resultado del análisis, un final incoherente (endConsistency)
+// baja el nivel a "Revisa la cuadrícula" aunque las confianzas sean altas (end: el motivo, para el aviso).
+export function confidenceInfo(conf, result = null) {
   const b = conf && Number.isFinite(conf.beats) ? conf.beats : 0;
   const k = conf && Number.isFinite(conf.bars) ? conf.bars : 0;
   const v = Math.min(b, k);
+  if (result && endConsistency(result).ok === false) {
+    return { level: 'low', label: 'Revisa la cuadrícula', low: true, value: v, end: true };
+  }
   if (v >= 0.75) return { level: 'high', label: 'Detección fiable', low: false, value: v };
   if (v >= 0.5) return { level: 'medium', label: 'Detección aceptable', low: false, value: v };
   return { level: 'low', label: 'Revisa la cuadrícula', low: true, value: v };
 }
 
-// "Corte en 3:41.25 · la canción pasa de 3:52 a 3:41"
-export function cutReadout(cutTime, duration) {
+// "Corte en 3:41.25 · la canción pasa de 3:52 a 3:41"; con el compás nuevo (outputDuration) la duración final es
+// otra: "Corte en 3:41.25 · con el compás nuevo pasa de 3:52 a 3:18"
+export function cutReadout(cutTime, duration, outputDuration) {
+  if (Number.isFinite(outputDuration)) {
+    return `Corte en ${formatTime(cutTime)} · con el compás nuevo pasa de ${formatDuration(duration)} a ${formatDuration(outputDuration)}`;
+  }
   return `Corte en ${formatTime(cutTime)} · la canción pasa de ${formatDuration(duration)} a ${formatDuration(cutTime)}`;
 }
 
@@ -258,13 +293,15 @@ export function shortcutAction(e) {
   if (e.targetEditable || tag === 'TEXTAREA' || tag === 'SELECT') return null;
   if (tag === 'INPUT' && type !== 'button' && type !== 'submit') return null;
   const k = e.key;
-  if (k === ' ' || k === 'Spacebar') return tag === 'SUMMARY' || tag === 'A' ? null : 'toggle-play';
+  // Espacio sobre un control con foco lo activa (comportamiento nativo); si no, reproduce / pausa
+  if (k === ' ' || k === 'Spacebar') return tag === 'SUMMARY' || tag === 'A' || tag === 'BUTTON' || tag === 'INPUT' ? null : 'toggle-play';
   if (k === 'ArrowLeft') return e.shiftKey ? 'cut-bar-prev' : 'cut-beat-prev';
   if (k === 'ArrowRight') return e.shiftKey ? 'cut-bar-next' : 'cut-beat-next';
   if (k === '+' || k === '=') return 'zoom-in';
   if (k === '-' || k === '_') return 'zoom-out';
   if (k === 'm' || k === 'M') return 'metronome';
   if (k === 'p' || k === 'P') return 'preview';
+  if (k === 't' || k === 'T') return 'tap-tempo';
   return null;
 }
 
@@ -285,7 +322,7 @@ export function errorMessage(kind, err) {
     case 'export':
       return 'No se pudo exportar el archivo.' + (detail ? ` (${detail})` : '');
     case 'preview':
-      return 'No se pudo reproducir el final.' + (detail ? ` (${detail})` : '');
+      return 'No se pudo reproducir la vista previa.' + (detail ? ` (${detail})` : '');
     case 'webaudio':
       return 'Este navegador no puede procesar audio (falta Web Audio). Prueba con Chrome, Firefox o Safari actualizados.';
     default:

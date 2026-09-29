@@ -97,6 +97,12 @@ async function inPage({ songs }) {
   const order = [...new Set(stages.map((s) => s[0]))].join(',');
   check('etapas de progreso en orden', order === 'features,tempo,beats,bars', order);
   check('fracciones de progreso en [0, 1]', stages.every(([, f]) => f >= 0 && f <= 1));
+  const monotone = ['features', 'tempo', 'beats', 'bars'].every((st) => {
+    const fr = stages.filter(([s0]) => s0 === st).map(([, f]) => f);
+    return fr[0] === 0 && fr[fr.length - 1] === 1 && fr.every((f, i) => i === 0 || f > fr[i - 1]);
+  });
+  check('cada etapa va de 0 a 1 con fracciones crecientes', monotone, JSON.stringify(stages));
+  check('tailBeatsFrom en el resultado (−1 o índice de beat)', Number.isInteger(r.tailBeatsFrom) && r.tailBeatsFrom >= -1 && r.tailBeatsFrom < r.beats.length, r.tailBeatsFrom);
 
   // 3) retrack ×2 y ÷2, relabel con "1" forzado, peticiones simultáneas
   const d = r.downbeats[Math.floor(r.downbeats.length / 2)];
@@ -146,12 +152,17 @@ async function inPage({ songs }) {
     const c2 = new AnalysisClient();
     const t1 = performance.now();
     const st = {};
+    const featureFractions = [];
     let prev = t1;
+    let stageStart = t1;
     const res = await watchMainThread(c2.analyze(y, 22050, {}, (stage, fraction) => {
       const t = performance.now();
-      if (fraction === 1) st[stage] = t - prev;
+      if (fraction === 0) stageStart = t;
+      if (fraction === 1) st[stage] = t - stageStart;
+      if (stage === 'features') featureFractions.push([fraction, Math.round(t - t1)]);
       prev = t;
     }));
+    out.timings.longFeatureFractions = featureFractions;
     out.timings.longMs = performance.now() - t1;
     out.timings.longMaxGapMs = res.maxGap;
     out.timings.longStagesSeenFromMain = st;
@@ -218,6 +229,9 @@ async function main() {
       add('canción de 4:30: < 10 s en el worker', out.timings.longMs < 10000, `${out.timings.longMs.toFixed(0)} ms`);
       add('canción de 4:30: el hilo principal no se bloquea (hueco máx. < 250 ms)', out.timings.longMaxGapMs < 250, `${out.timings.longMaxGapMs.toFixed(0)} ms`);
       add('canción de 4:30: mismos beats que en Node', L.beats.length === nodeLong.beats.length && L.beats.every((t, i) => Math.abs(t - nodeLong.beats[i]) < 1e-3));
+      const ff = out.timings.longFeatureFractions;
+      const mid = ff.filter(([f]) => f > 0 && f < 1);
+      add('canción de 4:30: progreso dentro de "features" (≥ 5 fracciones intermedias, crecientes)', mid.length >= 5 && ff.every(([f], i) => i === 0 || f > ff[i - 1][0]), JSON.stringify(ff));
     }
     add('sin errores en la página', pageErrors.length === 0, pageErrors.join(' | '));
 
@@ -232,6 +246,8 @@ async function main() {
     if (long) {
       console.log(`  worker en Chromium: 4:30 (${out.timings.longSeconds.toFixed(1)} s de audio) ${out.timings.longMs.toFixed(0)} ms, ` +
         `etapas dentro del worker ${JSON.stringify(out.timings.longWorkerTimings)}, hueco máx. del hilo principal ${out.timings.longMaxGapMs.toFixed(0)} ms`);
+      console.log(`  etapas vistas desde el hilo principal (ms): ${JSON.stringify(out.timings.longStagesSeenFromMain)}`);
+      console.log(`  progreso de 'features' [fracción, ms]: ${JSON.stringify(out.timings.longFeatureFractions)}`);
     }
   } finally {
     await browser.close();

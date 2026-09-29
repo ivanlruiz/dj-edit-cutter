@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { computeFeatures } from '../js/analysis/features.js';
 import { findMusicBounds } from '../js/analysis/bounds.js';
-import { trackBeats, dpForward, tempoPath, beatEnvelope, octaveEvidence, DP_DEFAULTS } from '../js/analysis/beats-dp.js';
+import { trackBeats, dpForward, tempoPath, beatEnvelope, octaveEvidence, offCoreFraction, DP_DEFAULTS } from '../js/analysis/beats-dp.js';
 import { generateSong } from './synth/generate.js';
 import { fMeasure, tempoCheck } from './synth/metrics.js';
 
@@ -250,6 +250,34 @@ test('dpForward recupera una rejilla de impulsos y tempoPath sigue un cambio de 
   const bpmAt = (t) => (60 * f.fps) / period[Math.round(t * f.fps)];
   assert.ok(Math.abs(bpmAt(8) / 100 - 1) < 0.03, `8 s: ${bpmAt(8)}`);
   assert.ok(Math.abs(bpmAt(32) / 120 - 1) < 0.03, `32 s: ${bpmAt(32)}`);
+});
+
+test('tempoPath con núcleo: fuera de la zona final no sale de [0.785, 1.27] × tempo global; en la zona final sí', () => {
+  // clics a 100 BPM y luego a 70 BPM (0.7×)
+  const { x } = clickTrain({ sec: 40, bpmAt: (t) => (t < 20 ? 100 : 70) });
+  const f = computeFeatures(x, SR);
+  const { env } = beatEnvelope(f, 0, f.numFrames - 1);
+  const bpmAt = (period, t) => (60 * f.fps) / period[Math.round(t * f.fps)];
+  const free = tempoPath(env, f.fps, 100);
+  assert.ok(Math.abs(bpmAt(free, 32) / 70 - 1) < 0.04, `sin núcleo: ${bpmAt(free, 32)}`);
+  const core = tempoPath(env, f.fps, 100, { coreLo: DP_DEFAULTS.pathCoreLo, coreHi: DP_DEFAULTS.pathCoreHi, endFrame: f.numFrames + 1e6 });
+  assert.ok(bpmAt(core, 32) >= 78.4, `con núcleo: ${bpmAt(core, 32)}`);
+  assert.ok(Math.abs(bpmAt(core, 8) / 100 - 1) < 0.03);
+  // la zona final (ritardando) se abre: con el final en 41 s y 16 beats de zona, a 38 s vuelve a 70
+  const end = tempoPath(env, f.fps, 100, { coreLo: DP_DEFAULTS.pathCoreLo, coreHi: DP_DEFAULTS.pathCoreHi, endFrame: Math.round(41 * f.fps), endBeats: 16 });
+  assert.ok(Math.abs(bpmAt(end, 38) / 70 - 1) < 0.05, `zona final: ${bpmAt(end, 38)}`);
+});
+
+test('offCoreFraction: fracción de beats fuera del núcleo antes de la zona final', () => {
+  const fps = 86;
+  const at = (bpm, n, t0 = 0) => Array.from({ length: n }, (_, i) => Math.round(t0 + (i * 60 * fps) / bpm));
+  const steady = at(100, 40);
+  const { pathCoreLo: lo, pathCoreHi: hi } = DP_DEFAULTS;
+  assert.equal(offCoreFraction(steady, 100, fps, Infinity, lo, hi), 0);
+  for (const r of [4 / 3, 3 / 4, 2 / 3]) assert.ok(offCoreFraction(at(100 * r, 40), 100, fps, Infinity, lo, hi) > 0.9, `×${r.toFixed(2)}`);
+  assert.equal(offCoreFraction(at(112, 40), 100, fps, Infinity, lo, hi), 0, 'una deriva del 12 % queda dentro');
+  // lo que cae después de la zona final no cuenta
+  assert.equal(offCoreFraction(at(100 * (4 / 3), 40), 100, fps, -1, lo, hi), 0);
 });
 
 test('octaveEvidence: paridad y contratiempos', () => {

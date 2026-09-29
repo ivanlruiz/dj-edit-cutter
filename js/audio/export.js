@@ -1,8 +1,8 @@
 // Exportación del edit a WAV o MP3 (+ etiquetas ID3 del original).
 
-import { encodeWav } from './wav.js';
+import { encodeWavBlob } from './wav.js';
 import { readId3v2, keepPortableFrames, buildId3v2 } from './id3.js';
-import { resampleAsync } from './decode.js';
+import { resampleAsync, yieldTask } from './decode.js';
 
 const MPEG1_RATES = [32000, 44100, 48000];
 const SAMPLES_PER_FRAME = 1152;          // MPEG-1 capa III
@@ -11,7 +11,10 @@ const DECODER_DELAY = 529;               // retardo del decodificador (lo suman 
 const SEG_PREROLL_FRAMES = 4;            // frames de calentamiento de cada segmento paralelo (se descartan)
 const SEG_POSTROLL_FRAMES = 3;           // audio extra al final de un segmento para no depender del flush
 const SEG_MIN_SECONDS = 12;
-const MAX_WORKERS = 6;
+// Cada worker lleva su copia del tramo y su montón de lamejs: con 6 workers un MP3 de 7 min pasaba de 1,9 GB en
+// Chrome (medido); 3 workers codifican igual de rápido en 4 núcleos. En móviles (o con ≤ 4 GB), 2.
+export const MAX_WORKERS = 3;
+export const MAX_WORKERS_LOW_MEMORY = 2;
 const EXPORT_RESAMPLER = { zeroCrossings: 24, rolloff: 0.95 };
 
 // Frecuencia a la que se codifica el MP3. Sólo frecuencias MPEG-1 (32/44,1/48 kHz): 192–320 kbps no existen
@@ -23,8 +26,18 @@ export function mp3SampleRateFor(sampleRate) {
   return 48000;
 }
 
-// "Mi canción (edit -4 compases).mp3"
-export function suggestFileName(originalName, { barsRemoved, format } = {}) {
+// Compás para el nombre: { num: 7, den: 8 } o "7/8" → "7-8" ('' si no es válido)
+function meterTag(meter) {
+  let num;
+  let den;
+  if (typeof meter === 'string') [num, den] = meter.split(/[/-]/).map(Number);
+  else if (meter && typeof meter === 'object') ({ num, den } = meter);
+  return Number.isInteger(num) && Number.isInteger(den) && num > 0 && den > 0 ? `${num}-${den}` : '';
+}
+
+// "Mi canción (edit -4 compases).mp3"; con compás nuevo: "Mi canción (7-8, edit -4 compases).mp3", y si solo
+// cambia el compás (barsRemoved null/undefined): "Mi canción (7-8).mp3"
+export function suggestFileName(originalName, { barsRemoved, format, meter = null } = {}) {
   let base = String(originalName == null ? '' : originalName).split(/[\\/]/).pop();
   base = base.replace(/\.[A-Za-z0-9]{1,5}$/, '');
   if (typeof base.normalize === 'function') base = base.normalize('NFC');
@@ -36,13 +49,19 @@ export function suggestFileName(originalName, { barsRemoved, format } = {}) {
   if (chars.length > 120) base = chars.slice(0, 120).join('').trim();
   if (!base) base = 'Canción';
   const ext = String(format).toLowerCase() === 'wav' ? 'wav' : 'mp3';
-  const n = Math.round(Number(barsRemoved) * 10) / 10;
-  let tag = 'edit';
-  if (Number.isFinite(n) && n > 0) {
-    const txt = Number.isInteger(n) ? String(n) : n.toFixed(1).replace('.', ',');
-    tag = `edit -${txt} ${n === 1 ? 'compás' : 'compases'}`;
+  const parts = [];
+  const mt = meterTag(meter);
+  if (mt) parts.push(mt);
+  if (!mt || (barsRemoved !== null && barsRemoved !== undefined)) {
+    const n = Math.round(Number(barsRemoved) * 10) / 10;
+    let tag = 'edit';
+    if (Number.isFinite(n) && n > 0) {
+      const txt = Number.isInteger(n) ? String(n) : n.toFixed(1).replace('.', ',');
+      tag = `edit -${txt} ${n === 1 ? 'compás' : 'compases'}`;
+    }
+    parts.push(tag);
   }
-  return `${base} (${tag}).${ext}`;
+  return `${base} (${parts.join(', ')}).${ext}`;
 }
 
 // Etiqueta ID3v2 reconstruida a partir del archivo original (null si no había o no queda nada útil)
@@ -158,10 +177,29 @@ export function buildLameInfoFrame(firstHeader, { frames, audioBytes, sampleCoun
 
 // ---------- codificación MP3 (workers) ----------
 
-function workerCount(limit) {
-  const hc = (globalThis.navigator && navigator.hardwareConcurrency) || 2;
-  const n = Math.max(1, Math.min(MAX_WORKERS, hc - 1));
+function lowMemoryDevice() {
+  const nav = globalThis.navigator;
+  if (nav && Number(nav.deviceMemory) > 0 && Number(nav.deviceMemory) <= 4) return true;
+  try {
+    return typeof globalThis.matchMedia === 'function' && globalThis.matchMedia('(pointer: coarse)').matches;
+  } catch {
+    return false;
+  }
+}
+
+export function workerCount(limit, { hardwareConcurrency, lowMemory } = {}) {
+  const hc = hardwareConcurrency || (globalThis.navigator && navigator.hardwareConcurrency) || 2;
+  const low = lowMemory === undefined ? lowMemoryDevice() : lowMemory;
+  const n = Math.max(1, Math.min(low ? MAX_WORKERS_LOW_MEMORY : MAX_WORKERS, hc - 1));
   return limit > 0 ? Math.min(n, Math.floor(limit)) : n;
+}
+
+// Fuente de audio por tramos { length, numberOfChannels, read(s0, s1) → Float32Array[] NUEVOS } a partir de canales
+export function channelSource(channels) {
+  const chans = Array.from(channels || []);
+  let n = chans.length ? Infinity : 0;
+  for (const c of chans) n = Math.min(n, c.length);
+  return { length: n, numberOfChannels: chans.length, read: (a, b) => chans.map((c) => c.slice(a, b)) };
 }
 
 // Divide la canción en segmentos alineados a frames. Cada segmento se codifica con unos frames de
@@ -186,8 +224,9 @@ export function planSegments(sampleCount, sampleRate, workers) {
   return segs;
 }
 
-function encodeMp3(channels, sampleRate, kbps, onProgress, maxWorkers) {
-  const n = Math.min(...channels.map((c) => c.length));
+// source: { length, numberOfChannels, read(s0, s1) } (cada tramo se lee justo antes de mandarlo a un worker)
+function encodeMp3(source, sampleRate, kbps, onProgress, maxWorkers) {
+  const n = source.length;
   const workersWanted = workerCount(maxWorkers);
   const segs = planSegments(n, sampleRate, workersWanted);
   const nWorkers = Math.min(workersWanted, segs.length);
@@ -222,8 +261,8 @@ function encodeMp3(channels, sampleRate, kbps, onProgress, maxWorkers) {
       const k = next++;
       const s = segs[k];
       worker.segment = k;
-      // copias propias por segmento: no se tocan (ni se desenganchan) los arrays del llamador
-      const chans = channels.map((c) => c.slice(s.s0, s.s1));
+      // copias propias por segmento (se transfieren): no se tocan los arrays del llamador
+      const chans = source.read(s.s0, s.s1);
       worker.postMessage({
         channels: chans, sampleRate, kbps,
         sampleOffset: s.s0, dropFrames: s.dropFrames, maxFrames: s.maxFrames,
@@ -232,7 +271,8 @@ function encodeMp3(channels, sampleRate, kbps, onProgress, maxWorkers) {
     for (let i = 0; i < nWorkers; i++) {
       let worker;
       try {
-        worker = new Worker(new URL('./mp3-worker.js', import.meta.url));
+        // misma versión (?v=) que este módulo: tras publicar, el worker no sale de la caché vieja
+        worker = new Worker(new URL(`./mp3-worker.js${new URL(import.meta.url).search}`, import.meta.url));
       } catch {
         fail('No se pudo iniciar el codificador MP3.');
         return;
@@ -270,12 +310,17 @@ function encodeMp3(channels, sampleRate, kbps, onProgress, maxWorkers) {
   });
 }
 
-async function exportMp3({ channels, sampleRate, kbps, tagBytes, onProgress, maxWorkers }) {
-  let chans = Array.from(channels);
-  if (!chans.length) throw new Error('No hay audio para guardar.');
-  if (chans.length > 2) chans = downmixToStereo(chans);
+async function exportMp3({ source, sampleRate, kbps, tagBytes, onProgress, maxWorkers }) {
+  if (!source.numberOfChannels) throw new Error('No hay audio para guardar.');
   const srcRate = Math.round(sampleRate);
   const rate = mp3SampleRateFor(srcRate);
+  let src = source;
+  let chans = null;
+  // Remuestreo o más de 2 canales: hace falta la salida entera; si no, cada worker lee solo su tramo
+  if (rate !== srcRate || source.numberOfChannels > 2) {
+    chans = source.read(0, source.length);
+    if (chans.length > 2) chans = downmixToStereo(chans);
+  }
   let base = 0;
   if (rate !== srcRate) {
     // Remuestreo propio (sinc): el de OfflineAudioContext en Chrome es lineal y sin anti-alias
@@ -289,8 +334,10 @@ async function exportMp3({ channels, sampleRate, kbps, tagBytes, onProgress, max
     chans = out;
     base = 0.15;
   }
+  if (chans) src = channelSource(chans);
+  chans = null;
   const bitrate = [192, 256, 320].includes(Number(kbps)) ? Number(kbps) : Number(kbps) > 0 ? Number(kbps) : 320;
-  const results = await encodeMp3(chans, rate, bitrate, (f) => onProgress(base + (1 - base) * f * 0.99), maxWorkers);
+  const results = await encodeMp3(src, rate, bitrate, (f) => onProgress(base + (1 - base) * f * 0.99), maxWorkers);
   const chunks = [];
   let frames = 0;
   let audioBytes = 0;
@@ -301,7 +348,7 @@ async function exportMp3({ channels, sampleRate, kbps, tagBytes, onProgress, max
       audioBytes += c.length;
     }
   }
-  const sampleCount = Math.min(...chans.map((c) => c.length));
+  const sampleCount = src.length;
   const parts = [];
   if (tagBytes) parts.push(tagBytes);
   const first = chunks.find((c) => c.length >= 4);
@@ -316,16 +363,20 @@ async function exportMp3({ channels, sampleRate, kbps, tagBytes, onProgress, max
 }
 
 // Punto de entrada: devuelve un Blob listo para descargar. No modifica los arrays de entrada.
-// maxWorkers (opcional): límite de workers MP3 en paralelo (por defecto hardwareConcurrency - 1, máx. 6).
-export async function exportAudio({ channels, sampleRate, format, bitDepth, kbps, sourceBytes,
+// Audio: `channels` (Float32Array[]) o `source` = { length, numberOfChannels, read(s0, s1) → Float32Array[] } para
+// leer la salida por tramos sin tenerla entera en memoria. Etiquetas: `tagBytes` (ya filtradas, buildTagBytes) o
+// `sourceBytes` (el archivo original). maxWorkers (opcional): límite de workers MP3 (por defecto
+// hardwareConcurrency − 1, máx. 3; 2 en móviles).
+export async function exportAudio({ channels, source = null, sampleRate, format, bitDepth, kbps, sourceBytes, tagBytes,
   keepTags = true, onProgress = () => {}, maxWorkers = 0 } = {}) {
   const progress = typeof onProgress === 'function' ? onProgress : () => {};
-  const tagBytes = keepTags ? buildTagBytes(sourceBytes) : null;
+  const tags = !keepTags ? null : tagBytes !== undefined ? tagBytes || null : buildTagBytes(sourceBytes);
+  const src = source || channelSource(channels);
   if (String(format).toLowerCase() === 'mp3') {
-    return exportMp3({ channels, sampleRate, kbps, tagBytes, onProgress: progress, maxWorkers });
+    return exportMp3({ source: src, sampleRate, kbps, tagBytes: tags, onProgress: progress, maxWorkers });
   }
   progress(0);
-  const wav = encodeWav(Array.from(channels || []), sampleRate, { bitDepth: Number(bitDepth) === 24 ? 24 : 16, id3: tagBytes });
-  progress(1);
-  return new Blob([wav], { type: 'audio/wav' });
+  return encodeWavBlob(src, sampleRate, {
+    bitDepth: Number(bitDepth) === 24 ? 24 : 16, id3: tags, onProgress: progress, yieldFn: yieldTask,
+  });
 }

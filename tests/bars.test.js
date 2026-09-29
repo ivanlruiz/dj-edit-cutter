@@ -153,7 +153,7 @@ test('barsRemovedAt: inversa de cutForBarsRemoved y fracciones en beats', () => 
   assert.equal(barsRemovedAt(r, lastStart + 2.0), 0); // en el final del último compás
   assert.equal(barsRemovedAt(r, 100), 0);
   assert.equal(barsRemovedAt(r, 0), 10); // antes del compás 1: todos
-  assert.equal(barsRemovedAt(r, lastStart - 0.004), 1); // pre-roll de 4 ms
+  assert.equal(barsRemovedAt(r, lastStart - 0.008), 1); // pre-roll de 8 ms (CUT_PREROLL_SEC)
   assert.equal(barsRemovedAt({ beats: [], downbeats: [] }, 3), 0);
   assert.equal(barsRemovedAt(r, NaN), 0);
 });
