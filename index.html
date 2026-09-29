@@ -1,0 +1,278 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>DJ Edit Cutter</title>
+  <meta name="description" content="Quita compases del final de una canción con un fade out ajustable. Todo se procesa en tu navegador: tu música no sale de tu dispositivo.">
+  <meta name="color-scheme" content="dark light">
+  <meta name="theme-color" content="#0a0e13" media="(prefers-color-scheme: dark)">
+  <meta name="theme-color" content="#eef2f7" media="(prefers-color-scheme: light)">
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%230a0e13'/%3E%3Cg fill='%2322c7ee'%3E%3Crect x='8' y='27' width='5' height='10' rx='2.5'/%3E%3Crect x='16' y='18' width='5' height='28' rx='2.5'/%3E%3Crect x='24' y='23' width='5' height='18' rx='2.5'/%3E%3Crect x='32' y='13' width='5' height='38' rx='2.5'/%3E%3C/g%3E%3Cg fill='%233a4757'%3E%3Crect x='46' y='24' width='5' height='16' rx='2.5'/%3E%3Crect x='54' y='28' width='4' height='8' rx='2'/%3E%3C/g%3E%3Crect x='40' y='7' width='3.5' height='50' rx='1.75' fill='%23ff6a3d'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="css/app.css">
+  <script type="module" src="js/main.js"></script>
+</head>
+<body data-phase="empty">
+  <header class="app-header">
+    <div class="brand">
+      <svg class="logo" viewBox="0 0 64 64" aria-hidden="true">
+        <rect width="64" height="64" rx="14" class="logo-bg"/>
+        <g class="logo-wave"><rect x="8" y="27" width="5" height="10" rx="2.5"/><rect x="16" y="18" width="5" height="28" rx="2.5"/><rect x="24" y="23" width="5" height="18" rx="2.5"/><rect x="32" y="13" width="5" height="38" rx="2.5"/></g>
+        <g class="logo-cut-wave"><rect x="46" y="24" width="5" height="16" rx="2.5"/><rect x="54" y="28" width="4" height="8" rx="2"/></g>
+        <rect x="40" y="7" width="3.5" height="50" rx="1.75" class="logo-cut"/>
+      </svg>
+      <div>
+        <h1>DJ Edit Cutter</h1>
+        <p class="tagline">Quita compases del final de una canción</p>
+      </div>
+    </div>
+    <p class="privacy">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2 4 5v6c0 5 3.4 9.4 8 11 4.6-1.6 8-6 8-11V5l-8-3Zm-1.2 14.2-3.5-3.5 1.4-1.4 2.1 2.1 4.9-4.9 1.4 1.4-6.3 6.3Z"/></svg>
+      <span>Tu música no sale de tu dispositivo: todo se procesa en el navegador.</span>
+    </p>
+  </header>
+
+  <main id="main">
+    <section id="loader" class="loader" data-state="empty" aria-label="Canción">
+      <input type="file" id="file-input" class="file-input" accept="audio/*,.mp3,.wav,.wave,.flac,.m4a,.mp4,.aac,.ogg,.oga,.opus,.webm,.aif,.aiff">
+      <label for="file-input" class="dropzone" id="dropzone">
+        <svg class="dz-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a1 1 0 0 1 .7.3l4 4-1.4 1.4L13 6.4V15h-2V6.4L8.7 8.7 7.3 7.3l4-4A1 1 0 0 1 12 3ZM5 14h2v4h10v-4h2v5a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1v-5Z"/></svg>
+        <span class="dz-title">Arrastra una canción aquí o toca para elegirla</span>
+        <span class="dz-sub">MP3, WAV, FLAC, M4A u OGG · se analiza en tu dispositivo</span>
+      </label>
+
+      <div class="song-bar" id="song-bar" hidden>
+        <svg class="song-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 3v10.6A4 4 0 1 0 11 17V7h6V3H9Z"/></svg>
+        <div class="song-meta">
+          <span class="song-name" id="song-name"></span>
+          <span class="song-sub" id="song-sub"></span>
+        </div>
+        <button type="button" class="btn" id="btn-change">Cambiar canción</button>
+      </div>
+
+      <div class="progress-box" id="progress-box" hidden>
+        <div class="progress-head">
+          <span id="progress-stage">Leyendo archivo…</span>
+          <span id="progress-pct" class="num">0 %</span>
+        </div>
+        <div class="progress" id="progress" role="progressbar" aria-label="Progreso del análisis" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+          <div class="progress-fill" id="progress-fill"></div>
+        </div>
+        <ol class="stages" id="stages">
+          <li data-stage="read">Leyendo archivo</li>
+          <li data-stage="features">Detectando notas</li>
+          <li data-stage="tempo">Calculando tempo</li>
+          <li data-stage="beats">Buscando beats</li>
+          <li data-stage="bars">Buscando compases</li>
+        </ol>
+      </div>
+
+      <div class="error-box" id="error-box" role="alert" hidden>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2 1 21h22L12 2Zm1 15h-2v-2h2v2Zm0-4h-2V9h2v4Z"/></svg>
+        <div>
+          <strong>No se pudo cargar la canción</strong>
+          <p id="error-text"></p>
+        </div>
+      </div>
+    </section>
+
+    <section id="editor" class="editor" hidden aria-label="Editor">
+      <div class="card wave-card">
+        <div class="wave-toolbar">
+          <p class="wave-help">Toca la onda para ir a ese punto · arrastra para desplazarte · pellizca o usa la rueda para el zoom</p>
+          <div class="zoom-group" role="group" aria-label="Zoom de la forma de onda">
+            <button type="button" class="icon-btn" id="btn-zoom-in" aria-label="Acercar" title="Acercar (+)">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10 3a7 7 0 0 1 5.6 11.2l5.1 5.1-1.4 1.4-5.1-5.1A7 7 0 1 1 10 3Zm0 2a5 5 0 1 0 0 10 5 5 0 0 0 0-10Zm1 2v2h2v2h-2v2H9v-2H7V9h2V7h2Z"/></svg>
+            </button>
+            <button type="button" class="icon-btn" id="btn-zoom-out" aria-label="Alejar" title="Alejar (−)">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10 3a7 7 0 0 1 5.6 11.2l5.1 5.1-1.4 1.4-5.1-5.1A7 7 0 1 1 10 3Zm0 2a5 5 0 1 0 0 10 5 5 0 0 0 0-10ZM7 9h6v2H7V9Z"/></svg>
+            </button>
+            <button type="button" class="btn btn-sm" id="btn-zoom-all">Ver todo</button>
+            <button type="button" class="btn btn-sm btn-cut-outline" id="btn-zoom-cut">Ir al corte</button>
+          </div>
+        </div>
+        <div class="wave" id="wave"></div>
+        <div class="transport">
+          <button type="button" class="play-btn" id="btn-play" aria-pressed="false" aria-label="Reproducir" data-state="paused" title="Reproducir / pausa (Espacio)">
+            <svg class="i-play" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5.1v13.8a1 1 0 0 0 1.5.9l10.8-6.9a1 1 0 0 0 0-1.7L9.5 4.2A1 1 0 0 0 8 5.1Z"/></svg>
+            <svg class="i-pause" viewBox="0 0 24 24" aria-hidden="true"><path d="M7 5h3.5v14H7zM13.5 5H17v14h-3.5z"/></svg>
+            <span id="play-label" class="play-label">Reproducir</span>
+          </button>
+          <div class="time num" aria-label="Posición">
+            <span id="time-now">0:00.00</span><span class="time-sep">/</span><span id="time-total">0:00.00</span>
+          </div>
+          <button type="button" class="toggle" id="btn-metro" aria-pressed="false" title="Clic de metrónomo (M)">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9.2 2h5.6l4.6 18.2A1.5 1.5 0 0 1 18 22H6a1.5 1.5 0 0 1-1.4-1.8L9.2 2Zm1.6 2-1.3 5.3 4.2 4.9 1.8-2.1L14.2 4h-3.4Zm4.7 9.9-1.8 2.2L15.3 18h2.2l-2-4.1ZM8.8 12.1 7.3 18h5.6l-4.1-5.9Z"/></svg>
+            <span>Clic de metrónomo</span>
+          </button>
+        </div>
+      </div>
+
+      <div class="info-row" id="info-row">
+        <div class="info"><span class="info-label">Tempo</span><span class="info-value num" id="info-bpm">–</span></div>
+        <div class="info"><span class="info-label">Compás</span><span class="info-value" id="info-meter">–</span></div>
+        <div class="info"><span class="info-label">Compases</span><span class="info-value num" id="info-bars">–</span></div>
+        <span class="badge" id="info-conf" data-level="high">–</span>
+      </div>
+      <p class="hint hint-warn" id="low-conf-hint" hidden>La detección no es segura. Activa el clic de metrónomo y escucha: si el acento no cae en el «1», prueba «Tempo ×2 / ÷2», cambia los tiempos por compás o usa «Mover el 1».</p>
+      <p class="hint hint-warn" id="no-grid-hint" hidden>No se encontraron compases en este audio. Arrastra el marcador naranja para colocar el corte a mano.</p>
+
+      <div class="panels">
+        <section class="card panel" id="panel-review" aria-labelledby="h-review">
+          <h2 id="h-review"><span class="step">1</span>Revisa los compases</h2>
+          <p class="panel-help">Pulsa reproducir con el clic activado: el sonido agudo debe caer en el «1» de cada compás.</p>
+          <div class="row">
+            <span class="row-label">Tempo</span>
+            <div class="seg" role="group" aria-label="Corregir tempo">
+              <button type="button" class="btn" id="btn-tempo-double">Tempo ×2</button>
+              <button type="button" class="btn" id="btn-tempo-half">Tempo ÷2</button>
+            </div>
+          </div>
+          <div class="row">
+            <label class="row-label" for="sel-meter">Tiempos por compás</label>
+            <select id="sel-meter" class="select">
+              <option value="auto">Auto</option>
+              <option value="2">2</option>
+              <option value="3">3</option>
+              <option value="4">4</option>
+              <option value="5">5</option>
+              <option value="6">6</option>
+              <option value="7">7</option>
+            </select>
+          </div>
+          <div class="row">
+            <span class="row-label" id="lbl-one">Mover el 1</span>
+            <div class="seg" role="group" aria-labelledby="lbl-one">
+              <button type="button" class="btn icon-only" id="btn-one-prev" aria-label="Mover el 1 un beat antes">◀</button>
+              <button type="button" class="btn icon-only" id="btn-one-next" aria-label="Mover el 1 un beat después">▶</button>
+            </div>
+          </div>
+          <div class="row-buttons">
+            <button type="button" class="btn" id="btn-this-one" title="Usa el beat más cercano al cabezal de reproducción">Este beat es el 1</button>
+            <button type="button" class="btn btn-ghost" id="btn-reset-grid">Restablecer</button>
+          </div>
+          <p class="busy" id="review-busy" hidden><span class="spinner" aria-hidden="true"></span>Recalculando…</p>
+        </section>
+
+        <section class="card panel" id="panel-cut" aria-labelledby="h-cut">
+          <h2 id="h-cut"><span class="step">2</span>Elige el corte</h2>
+          <div class="stepper-row">
+            <span class="row-label" id="lbl-bars">Compases a quitar</span>
+            <div class="stepper" role="group" aria-labelledby="lbl-bars">
+              <button type="button" class="btn icon-only" id="btn-bars-minus" aria-label="Quitar un compás menos">−</button>
+              <output id="bars-value" class="stepper-value num" aria-live="polite">1</output>
+              <button type="button" class="btn icon-only" id="btn-bars-plus" aria-label="Quitar un compás más">+</button>
+            </div>
+          </div>
+          <div class="chips" id="bar-chips" role="group" aria-label="Elección rápida de compases a quitar"></div>
+          <p class="manual-note" id="manual-note" hidden></p>
+          <p class="readout num" id="cut-readout">–</p>
+          <div class="nudges">
+            <div class="nudge">
+              <span class="nudge-label" id="lbl-nudge-beat">Beat</span>
+              <div class="seg" role="group" aria-labelledby="lbl-nudge-beat">
+                <button type="button" class="btn icon-only" id="btn-beat-prev" aria-label="Mover el corte un beat antes" title="←">◀</button>
+                <button type="button" class="btn icon-only" id="btn-beat-next" aria-label="Mover el corte un beat después" title="→">▶</button>
+              </div>
+            </div>
+            <div class="nudge">
+              <span class="nudge-label" id="lbl-nudge-bar">Compás</span>
+              <div class="seg" role="group" aria-labelledby="lbl-nudge-bar">
+                <button type="button" class="btn icon-only" id="btn-bar-prev" aria-label="Mover el corte un compás antes" title="Mayús + ←">◀</button>
+                <button type="button" class="btn icon-only" id="btn-bar-next" aria-label="Mover el corte un compás después" title="Mayús + →">▶</button>
+              </div>
+            </div>
+            <div class="nudge">
+              <span class="nudge-label" id="lbl-nudge-ms">10 ms</span>
+              <div class="seg" role="group" aria-labelledby="lbl-nudge-ms">
+                <button type="button" class="btn icon-only" id="btn-ms-prev" aria-label="Mover el corte 10 milisegundos antes">−</button>
+                <button type="button" class="btn icon-only" id="btn-ms-next" aria-label="Mover el corte 10 milisegundos después">+</button>
+              </div>
+            </div>
+          </div>
+          <label class="switch">
+            <input type="checkbox" id="chk-snap" checked>
+            <span class="switch-track" aria-hidden="true"></span>
+            <span>Imán a los beats</span>
+          </label>
+          <p class="panel-help">Arrastra el marcador naranja en la onda. Con Alt o Mayús se mueve libremente.</p>
+        </section>
+
+        <section class="card panel" id="panel-final" aria-labelledby="h-final">
+          <h2 id="h-final"><span class="step">3</span>Final</h2>
+          <div class="field">
+            <div class="field-head">
+              <label for="rng-fade">Fade out</label>
+              <output id="fade-value" for="rng-fade" class="num">Corte seco (sin fade)</output>
+            </div>
+            <input type="range" id="rng-fade" class="range" min="0" max="6" step="1" value="0">
+            <div class="ticks" aria-hidden="true"><span>0</span><span>½</span><span>1</span><span>2</span><span>4</span><span>8</span><span>16</span></div>
+            <p class="field-note">En beats. 0 = corte seco (con una rampa mínima para evitar el clic).</p>
+          </div>
+          <div class="field">
+            <label for="sel-curve">Curva del fade</label>
+            <select id="sel-curve" class="select">
+              <option value="linear">Lineal</option>
+              <option value="smooth">Suave</option>
+              <option value="exp">Exponencial</option>
+            </select>
+          </div>
+          <button type="button" class="btn btn-accent btn-wide" id="btn-preview" data-state="idle" title="Escuchar el final (P)">
+            <svg class="i-play" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5.1v13.8a1 1 0 0 0 1.5.9l10.8-6.9a1 1 0 0 0 0-1.7L9.5 4.2A1 1 0 0 0 8 5.1Z"/></svg>
+            <svg class="i-stop" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6h12v12H6z"/></svg>
+            <span id="preview-label">Escuchar el final</span>
+          </button>
+          <p class="panel-help">Reproduce los últimos 8 segundos con el corte y el fade aplicados.</p>
+        </section>
+
+        <section class="card panel" id="panel-save" aria-labelledby="h-save">
+          <h2 id="h-save"><span class="step">4</span>Guardar</h2>
+          <fieldset class="formats" id="formats">
+            <legend>Formato</legend>
+            <div class="format-grid">
+              <label class="radio-chip"><input type="radio" name="format" value="wav16" checked><span>WAV <small>16 bits</small></span></label>
+              <label class="radio-chip"><input type="radio" name="format" value="wav24"><span>WAV <small>24 bits</small></span></label>
+              <label class="radio-chip"><input type="radio" name="format" value="mp3-320"><span>MP3 <small>320 kbps</small></span></label>
+              <label class="radio-chip"><input type="radio" name="format" value="mp3-256"><span>MP3 <small>256 kbps</small></span></label>
+              <label class="radio-chip"><input type="radio" name="format" value="mp3-192"><span>MP3 <small>192 kbps</small></span></label>
+            </div>
+          </fieldset>
+          <label class="check">
+            <input type="checkbox" id="chk-tags">
+            <span>Conservar etiquetas (título, artista, carátula)</span>
+          </label>
+          <p class="field-note" id="tags-note"></p>
+          <p class="filename">Se guardará como <strong id="out-name">–</strong></p>
+          <button type="button" class="btn btn-primary btn-wide btn-big" id="btn-export">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M11 3h2v9.6l3.3-3.3 1.4 1.4-5.7 5.7-5.7-5.7 1.4-1.4 3.3 3.3V3ZM5 18h14v2H5v-2Z"/></svg>
+            <span id="export-label">Descargar</span>
+          </button>
+          <div class="progress progress-sm" id="export-progress" role="progressbar" aria-label="Progreso de la exportación" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" hidden>
+            <div class="progress-fill" id="export-fill"></div>
+          </div>
+        </section>
+      </div>
+    </section>
+  </main>
+
+  <footer class="app-footer">
+    <details class="shortcuts">
+      <summary>Atajos de teclado</summary>
+      <dl>
+        <div><dt><kbd>Espacio</kbd></dt><dd>Reproducir / pausa</dd></div>
+        <div><dt><kbd>←</kbd> <kbd>→</kbd></dt><dd>Mover el corte un beat</dd></div>
+        <div><dt><kbd>Mayús</kbd> + <kbd>←</kbd> <kbd>→</kbd></dt><dd>Mover el corte un compás</dd></div>
+        <div><dt><kbd>+</kbd> <kbd>−</kbd></dt><dd>Acercar / alejar</dd></div>
+        <div><dt><kbd>M</kbd></dt><dd>Clic de metrónomo</dd></div>
+        <div><dt><kbd>P</kbd></dt><dd>Escuchar el final</dd></div>
+      </dl>
+    </details>
+    <p>Nada se sube a internet: la canción se procesa en tu dispositivo.</p>
+    <p>Exportación MP3 con <a href="https://lame.sourceforge.net/" target="_blank" rel="noopener">LAME</a> (lamejs, <a href="vendor/LICENSE-lamejs.txt" target="_blank" rel="noopener">LGPL</a>).</p>
+  </footer>
+
+  <div class="drop-overlay" aria-hidden="true"><span>Suelta la canción para cargarla</span></div>
+  <div id="toast" class="toast" aria-hidden="true" hidden></div>
+  <div id="status" class="sr-only" role="status" aria-live="polite"></div>
+</body>
+</html>

@@ -1,0 +1,1007 @@
+// Vista de forma de onda (canvas): tira de resumen + vista con zoom, cuadrícula de beats/compases,
+// marcador de corte arrastrable, fade, zona que se quita y cabezal de reproducción.
+// Las funciones puras exportadas (picos, imán, zoom) se prueban en Node.
+
+import { clamp, nearestIndex, lowerBound, formatTime } from './format.js';
+
+export const PEAK_BLOCK = 256;
+export const MIN_VIEW_SPAN = 0.1; // s
+
+// Mipmap de picos: nivel 0 = min/max/rms cada `blockSize` muestras (todas las pistas); cada nivel siguiente agrupa de a 2
+export function buildPeakPyramid(channels, blockSize = PEAK_BLOCK) {
+  const nch = channels.length;
+  const n = nch ? channels[0].length : 0;
+  const nb = Math.max(1, Math.ceil(n / blockSize));
+  const min = new Float32Array(nb);
+  const max = new Float32Array(nb);
+  const rms = new Float32Array(nb);
+  let peak = 0;
+  for (let b = 0; b < nb; b++) {
+    const i0 = b * blockSize;
+    const i1 = Math.min(n, i0 + blockSize);
+    let lo = Infinity;
+    let hi = -Infinity;
+    let sq = 0;
+    for (let c = 0; c < nch; c++) {
+      const d = channels[c];
+      for (let i = i0; i < i1; i++) {
+        const v = d[i];
+        if (v < lo) lo = v;
+        if (v > hi) hi = v;
+        sq += v * v;
+      }
+    }
+    const cnt = (i1 - i0) * nch;
+    if (cnt <= 0) {
+      lo = 0;
+      hi = 0;
+    }
+    min[b] = lo;
+    max[b] = hi;
+    rms[b] = cnt > 0 ? Math.sqrt(sq / cnt) : 0;
+    const a = Math.max(-lo, hi);
+    if (a > peak) peak = a;
+  }
+  const levels = [{ blockSize, min, max, rms }];
+  let cur = levels[0];
+  while (cur.min.length > 1) {
+    const len = Math.ceil(cur.min.length / 2);
+    const nmin = new Float32Array(len);
+    const nmax = new Float32Array(len);
+    const nrms = new Float32Array(len);
+    for (let i = 0; i < len; i++) {
+      const a = 2 * i;
+      const b = Math.min(a + 1, cur.min.length - 1);
+      nmin[i] = Math.min(cur.min[a], cur.min[b]);
+      nmax[i] = Math.max(cur.max[a], cur.max[b]);
+      nrms[i] = Math.sqrt((cur.rms[a] * cur.rms[a] + cur.rms[b] * cur.rms[b]) / 2);
+    }
+    cur = { blockSize: cur.blockSize * 2, min: nmin, max: nmax, rms: nrms };
+    levels.push(cur);
+  }
+  return { levels, peak, length: n };
+}
+
+// Nivel más grueso cuyo bloque no supera las muestras por píxel (-1 = usar muestras crudas)
+export function pickLevel(pyramid, samplesPerPixel) {
+  const base = pyramid.levels[0].blockSize;
+  if (samplesPerPixel < base) return -1;
+  const k = Math.floor(Math.log2(samplesPerPixel / base));
+  return clamp(k, 0, pyramid.levels.length - 1);
+}
+
+// Imán: el beat más cercano si está a menos de `thresholdSec`
+export function snapToBeat(beats, time, thresholdSec) {
+  const i = nearestIndex(beats, time);
+  if (i >= 0 && Math.abs(beats[i] - time) <= thresholdSec) return { time: beats[i], index: i, snapped: true };
+  return { time, index: i, snapped: false };
+}
+
+export function clampView(start, end, duration, minSpan = MIN_VIEW_SPAN) {
+  if (!(duration > 0)) return { start: 0, end: 0 };
+  let span = clamp(end - start, Math.min(minSpan, duration), duration);
+  let s = start;
+  if (s < 0) s = 0;
+  if (s + span > duration) s = duration - span;
+  if (s < 0) s = 0;
+  return { start: s, end: s + span };
+}
+
+// Zoom manteniendo `anchor` (s) en el mismo sitio de la pantalla; factor < 1 acerca
+export function zoomView(view, factor, anchor, duration, minSpan = MIN_VIEW_SPAN) {
+  const span = view.end - view.start;
+  if (!(span > 0)) return clampView(0, duration, duration, minSpan);
+  const a = Number.isFinite(anchor) ? anchor : (view.start + view.end) / 2;
+  const rel = clamp((a - view.start) / span, 0, 1);
+  const nspan = clamp(span * factor, Math.min(minSpan, duration), duration);
+  return clampView(a - rel * nspan, a - rel * nspan + nspan, duration, minSpan);
+}
+
+const RULER_H = 20; // franja superior con números de compás
+const TIME_H = 16; // franja inferior con tiempos
+const TICK_STEPS = [0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600];
+
+const COLOR_VARS = {
+  bg: '--wf-bg', ruler: '--wf-ruler', peak: '--wf-peak', rms: '--wf-rms', ghost: '--wf-ghost',
+  removed: '--wf-removed', removedRms: '--wf-removed-rms', dim: '--wf-dim', hatch: '--wf-hatch',
+  beat: '--wf-beat', downbeat: '--wf-downbeat', barnum: '--wf-barnum', text: '--wf-text',
+  cut: '--wf-cut', cutText: '--wf-cut-text', fade: '--wf-fade', playhead: '--wf-playhead',
+  window: '--wf-window', windowBorder: '--wf-window-border', center: '--wf-center',
+};
+
+const FALLBACK_COLORS = {
+  bg: '#070b10', ruler: '#0d141c', peak: '#1f8fff', rms: '#62e3ff', ghost: 'rgba(98,227,255,0.18)',
+  removed: '#344150', removedRms: '#4b5968', dim: 'rgba(7,11,16,0.45)', hatch: 'rgba(255,255,255,0.05)',
+  beat: 'rgba(255,255,255,0.14)', downbeat: 'rgba(255,255,255,0.55)', barnum: '#d6e6f5', text: '#7f90a3',
+  cut: '#ff6a3d', cutText: '#1a0a04', fade: 'rgba(255,106,61,0.30)', playhead: '#ffffff',
+  window: 'rgba(98,227,255,0.14)', windowBorder: '#62e3ff', center: 'rgba(255,255,255,0.08)',
+};
+
+export class WaveformView extends EventTarget {
+  constructor(root, { overviewHeight = 44 } = {}) {
+    super();
+    this.root = root;
+    this.overviewHeight = overviewHeight;
+    this.overview = document.createElement('canvas');
+    this.overview.className = 'wf-overview';
+    this.overview.setAttribute('role', 'img');
+    this.overview.setAttribute('aria-label', 'Resumen de toda la canción. Toca para saltar a esa zona.');
+    this.main = document.createElement('canvas');
+    this.main.className = 'wf-main';
+    this.main.setAttribute('role', 'img');
+    this.main.setAttribute('aria-label', 'Forma de onda con la cuadrícula de compases y el punto de corte. Arrastra el marcador naranja para mover el corte.');
+    root.append(this.overview, this.main);
+
+    this.buffer = null;
+    this.channels = [];
+    this.sampleRate = 44100;
+    this.duration = 0;
+    this.pyramid = null;
+    this.norm = 1;
+    this.beats = [];
+    this.bars = [];
+    this.cutTime = null;
+    this.fadeSec = 0;
+    this.gainFn = null;
+    this.playhead = 0;
+    this.snap = true;
+    this.view = { start: 0, end: 0 };
+    this.colors = { ...FALLBACK_COLORS };
+    this._hatch = null;
+    this._dirty = true;
+    this._raf = 0;
+    this._pointers = new Map();
+    this._drag = null;
+    this._ovDrag = null;
+    this._lastInteraction = 0;
+    this._hoverCut = false;
+    this._cols = null;
+
+    this._readColors();
+    this._onResize = () => this._resize();
+    if (typeof ResizeObserver !== 'undefined') {
+      this._ro = new ResizeObserver(this._onResize);
+      this._ro.observe(root);
+    } else {
+      window.addEventListener('resize', this._onResize);
+    }
+    this._mql = window.matchMedia ? window.matchMedia('(prefers-color-scheme: dark)') : null;
+    this._onTheme = () => {
+      this._readColors();
+      this.invalidate();
+    };
+    if (this._mql && this._mql.addEventListener) this._mql.addEventListener('change', this._onTheme);
+
+    this._bindMain();
+    this._bindOverview();
+    this._resize();
+  }
+
+  // ---------- API pública ----------
+
+  setBuffer(audioBuffer) {
+    this.buffer = audioBuffer || null;
+    this.channels = [];
+    this.pyramid = null;
+    if (audioBuffer) {
+      for (let c = 0; c < audioBuffer.numberOfChannels; c++) this.channels.push(audioBuffer.getChannelData(c));
+      this.sampleRate = audioBuffer.sampleRate;
+      this.duration = audioBuffer.duration;
+      this.pyramid = buildPeakPyramid(this.channels);
+      this.norm = Math.min(8, 0.96 / Math.max(this.pyramid.peak, 1e-3));
+      this.view = { start: 0, end: this.duration };
+    } else {
+      this.duration = 0;
+      this.view = { start: 0, end: 0 };
+      this.beats = [];
+      this.bars = [];
+      this.cutTime = null;
+      this.fadeSec = 0;
+      this.playhead = 0;
+    }
+    this._emitView();
+    this.invalidate();
+  }
+
+  // beats: tiempos (s); bars: [{ start, number }] (p. ej. getBars(result))
+  setGrid({ beats = [], bars = [] } = {}) {
+    this.beats = beats;
+    this.bars = bars;
+    this.invalidate();
+  }
+
+  setCut(time) {
+    this.cutTime = Number.isFinite(time) ? time : null;
+    this.invalidate();
+  }
+
+  setFade(sec, gainFn = null) {
+    this.fadeSec = Math.max(0, sec || 0);
+    this.gainFn = gainFn;
+    this.invalidate();
+  }
+
+  setSnap(enabled) {
+    this.snap = !!enabled;
+  }
+
+  // follow: durante la reproducción, pasa de página cuando el cabezal sale de la vista
+  setPlayhead(time, { follow = false } = {}) {
+    this.playhead = Number.isFinite(time) ? time : 0;
+    if (follow && this.duration && !this._drag && performance.now() - this._lastInteraction > 1500) {
+      const { start, end } = this.view;
+      const span = end - start;
+      if (this.playhead > start + span * 0.94 || this.playhead < start) {
+        this.setView(this.playhead - span * 0.08, this.playhead + span * 0.92);
+      }
+    }
+    this.invalidate();
+  }
+
+  setView(start, end) {
+    const v = clampView(start, end, this.duration, this._minSpan());
+    if (v.start === this.view.start && v.end === this.view.end) return;
+    this.view = v;
+    this._emitView();
+    this.invalidate();
+  }
+
+  getView() {
+    return { ...this.view };
+  }
+
+  zoomBy(factor, anchor) {
+    const a = Number.isFinite(anchor) ? anchor : this._defaultAnchor();
+    const v = zoomView(this.view, factor, a, this.duration, this._minSpan());
+    this.setView(v.start, v.end);
+  }
+
+  showAll() {
+    this.setView(0, this.duration);
+  }
+
+  // Centra la vista en `time` (con `span` opcional)
+  centerOn(time, span) {
+    const s = Number.isFinite(span) ? span : this.view.end - this.view.start;
+    this.setView(time - s / 2, time + s / 2);
+  }
+
+  // Asegura que `time` sea visible (con margen)
+  reveal(time) {
+    const { start, end } = this.view;
+    const span = end - start;
+    const m = span * 0.06;
+    if (time < start + m) this.setView(time - span * 0.25, time + span * 0.75);
+    else if (time > end - m) this.setView(time - span * 0.75, time + span * 0.25);
+  }
+
+  get zoomLimits() {
+    const span = this.view.end - this.view.start;
+    return { canZoomIn: span > this._minSpan() * 1.01, canZoomOut: span < this.duration * 0.999 };
+  }
+
+  invalidate() {
+    this._dirty = true;
+    if (!this._raf && typeof requestAnimationFrame !== 'undefined') {
+      this._raf = requestAnimationFrame(() => {
+        this._raf = 0;
+        if (this._dirty) this._draw();
+      });
+    }
+  }
+
+  destroy() {
+    if (this._ro) this._ro.disconnect();
+    else window.removeEventListener('resize', this._onResize);
+    if (this._mql && this._mql.removeEventListener) this._mql.removeEventListener('change', this._onTheme);
+    if (this._raf) cancelAnimationFrame(this._raf);
+    this.overview.remove();
+    this.main.remove();
+  }
+
+  // ---------- internos ----------
+
+  _minSpan() {
+    const w = this._w || 600;
+    return Math.max(MIN_VIEW_SPAN, (w * 2) / (this.sampleRate || 44100));
+  }
+
+  _defaultAnchor() {
+    const { start, end } = this.view;
+    if (this.cutTime != null && this.cutTime >= start && this.cutTime <= end) return this.cutTime;
+    return (start + end) / 2;
+  }
+
+  _emitView() {
+    this.dispatchEvent(new CustomEvent('viewchange', { detail: { ...this.view } }));
+  }
+
+  _readColors() {
+    const cs = getComputedStyle(this.root);
+    for (const [k, v] of Object.entries(COLOR_VARS)) {
+      const val = cs.getPropertyValue(v).trim();
+      this.colors[k] = val || FALLBACK_COLORS[k];
+    }
+    this._hatch = null;
+  }
+
+  _resize() {
+    const dpr = Math.max(1, Math.min(3, window.devicePixelRatio || 1));
+    this._dpr = dpr;
+    for (const cv of [this.overview, this.main]) {
+      const r = cv.getBoundingClientRect();
+      const w = Math.max(1, Math.round(r.width * dpr));
+      const h = Math.max(1, Math.round(r.height * dpr));
+      if (cv.width !== w || cv.height !== h) {
+        cv.width = w;
+        cv.height = h;
+      }
+    }
+    const r = this.main.getBoundingClientRect();
+    this._w = r.width;
+    this._h = r.height;
+    const ro = this.overview.getBoundingClientRect();
+    this._ow = ro.width;
+    this._oh = ro.height;
+    this._dirty = true;
+    this._draw();
+  }
+
+  _xOf(t) {
+    const { start, end } = this.view;
+    return ((t - start) / (end - start)) * this._w;
+  }
+
+  _tOf(x) {
+    const { start, end } = this.view;
+    return start + (x / this._w) * (end - start);
+  }
+
+  _hatchPattern(ctx) {
+    if (this._hatch) return this._hatch;
+    const c = document.createElement('canvas');
+    const s = Math.round(10 * (this._dpr || 1));
+    c.width = s;
+    c.height = s;
+    const g = c.getContext('2d');
+    g.strokeStyle = this.colors.hatch;
+    g.lineWidth = Math.max(1, (this._dpr || 1) * 1.2);
+    g.beginPath();
+    g.moveTo(-1, s + 1);
+    g.lineTo(s + 1, -1);
+    g.moveTo(-1, 1);
+    g.lineTo(1, -1);
+    g.moveTo(s - 1, s + 1);
+    g.lineTo(s + 1, s - 1);
+    g.stroke();
+    this._hatch = ctx.createPattern(c, 'repeat');
+    if (this._hatch && this._hatch.setTransform && typeof DOMMatrix !== 'undefined') {
+      const k = 1 / (this._dpr || 1);
+      this._hatch.setTransform(new DOMMatrix([k, 0, 0, k, 0, 0]));
+    }
+    return this._hatch;
+  }
+
+  // Calcula min/max/rms por columna (ancho `cols`) para el intervalo [t0, t1]
+  _columns(t0, t1, cols) {
+    if (!this._cols || this._cols.lo.length < cols) {
+      this._cols = { lo: new Float32Array(cols), hi: new Float32Array(cols), rms: new Float32Array(cols) };
+    }
+    const { lo, hi, rms } = this._cols;
+    const sr = this.sampleRate;
+    const spp = ((t1 - t0) * sr) / cols;
+    const n = this.pyramid.length;
+    const level = pickLevel(this.pyramid, spp);
+    if (level < 0) {
+      const chs = this.channels;
+      const nch = chs.length;
+      for (let x = 0; x < cols; x++) {
+        let s0 = Math.floor((t0 * sr) + x * spp);
+        let s1 = Math.floor((t0 * sr) + (x + 1) * spp);
+        if (s1 <= s0) s1 = s0 + 1;
+        if (s0 < 0) s0 = 0;
+        if (s1 > n) s1 = n;
+        let l = Infinity;
+        let h = -Infinity;
+        let sq = 0;
+        for (let c = 0; c < nch; c++) {
+          const d = chs[c];
+          for (let i = s0; i < s1; i++) {
+            const v = d[i];
+            if (v < l) l = v;
+            if (v > h) h = v;
+            sq += v * v;
+          }
+        }
+        const cnt = (s1 - s0) * nch;
+        if (cnt <= 0) {
+          lo[x] = 0;
+          hi[x] = 0;
+          rms[x] = 0;
+        } else {
+          lo[x] = l;
+          hi[x] = h;
+          rms[x] = Math.sqrt(sq / cnt);
+        }
+      }
+      return this._cols;
+    }
+    const L = this.pyramid.levels[level];
+    const B = L.blockSize;
+    const nb = L.min.length;
+    for (let x = 0; x < cols; x++) {
+      const s0 = t0 * sr + x * spp;
+      const s1 = s0 + spp;
+      let b0 = Math.floor(s0 / B);
+      let b1 = Math.floor(s1 / B);
+      if (b1 <= b0) b1 = b0 + 1;
+      if (b0 < 0) b0 = 0;
+      if (b1 > nb) b1 = nb;
+      if (b0 >= b1 || s0 >= n) {
+        lo[x] = 0;
+        hi[x] = 0;
+        rms[x] = 0;
+        continue;
+      }
+      let l = Infinity;
+      let h = -Infinity;
+      let sq = 0;
+      for (let b = b0; b < b1; b++) {
+        if (L.min[b] < l) l = L.min[b];
+        if (L.max[b] > h) h = L.max[b];
+        sq += L.rms[b] * L.rms[b];
+      }
+      lo[x] = l;
+      hi[x] = h;
+      rms[x] = Math.sqrt(sq / (b1 - b0));
+    }
+    return this._cols;
+  }
+
+  _draw() {
+    this._dirty = false;
+    if (!this._w) return;
+    this._drawMain();
+    this._drawOverview();
+  }
+
+  _drawMain() {
+    const cv = this.main;
+    const ctx = cv.getContext('2d');
+    const dpr = this._dpr || 1;
+    const W = this._w;
+    const H = this._h;
+    const C = this.colors;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, W, H);
+    ctx.fillStyle = C.bg;
+    ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = C.ruler;
+    ctx.fillRect(0, 0, W, RULER_H);
+    ctx.fillRect(0, H - TIME_H, W, TIME_H);
+    if (!this.pyramid || !(this.view.end > this.view.start)) return;
+
+    const { start, end } = this.view;
+    const span = end - start;
+    const pxPerSec = W / span;
+    const waveTop = RULER_H + 2;
+    const waveBot = H - TIME_H - 2;
+    const mid = (waveTop + waveBot) / 2;
+    const amp = ((waveBot - waveTop) / 2) * this.norm;
+    const cut = this.cutTime;
+    const fade = cut != null ? Math.max(0, Math.min(this.fadeSec, cut)) : 0;
+    const fadeStart = cut != null ? cut - fade : Infinity;
+
+    // línea central
+    ctx.fillStyle = C.center;
+    ctx.fillRect(0, Math.round(mid), W, 1);
+
+    // forma de onda por columnas de píxel físico
+    const cols = Math.max(1, Math.round(W * dpr));
+    const colW = W / cols;
+    const { lo, hi, rms } = this._columns(start, end, cols);
+    const secPerCol = span / cols;
+    const colOf = (t) => clamp(Math.floor((t - start) / secPerCol), 0, cols);
+    const cFade = cut != null ? colOf(fadeStart) : cols;
+    const cCut = cut != null ? colOf(cut) : cols;
+    const gainAt = (x) => {
+      if (!fade) return 1;
+      const t = start + (x + 0.5) * secPerCol;
+      const p = clamp((t - fadeStart) / fade, 0, 1);
+      return this.gainFn ? clamp(this.gainFn(p), 0, 1) : 1 - p;
+    };
+    const drawRange = (x0, x1, peakColor, rmsColor, gain) => {
+      if (x1 <= x0) return;
+      ctx.fillStyle = peakColor;
+      for (let x = x0; x < x1; x++) {
+        const g = gain ? gain(x) : 1;
+        const top = mid - hi[x] * amp * g;
+        const bot = mid - lo[x] * amp * g;
+        ctx.fillRect(x * colW, top, colW, Math.max(colW, bot - top));
+      }
+      if (!rmsColor) return;
+      ctx.fillStyle = rmsColor;
+      for (let x = x0; x < x1; x++) {
+        const g = gain ? gain(x) : 1;
+        const r = Math.min(rms[x], Math.max(hi[x], -lo[x])) * amp * g;
+        if (r > 0.3) ctx.fillRect(x * colW, mid - r, colW, 2 * r);
+      }
+    };
+    drawRange(0, cFade, C.peak, C.rms);
+    if (cCut > cFade) {
+      drawRange(cFade, cCut, C.ghost, null);
+      drawRange(cFade, cCut, C.peak, C.rms, gainAt);
+    }
+    drawRange(cCut, cols, C.removed, C.removedRms);
+
+    // cuadrícula: beats finos, compases más marcados
+    const beats = this.beats;
+    if (beats.length > 1) {
+      const ibi = (beats[beats.length - 1] - beats[0]) / (beats.length - 1);
+      if (ibi * pxPerSec >= 5) {
+        ctx.fillStyle = C.beat;
+        for (let i = lowerBound(beats, start); i < beats.length && beats[i] <= end; i++) {
+          const x = Math.round(this._xOf(beats[i]));
+          ctx.globalAlpha = cut != null && beats[i] >= cut ? 0.5 : 1;
+          ctx.fillRect(x, waveTop, 1, waveBot - waveTop);
+        }
+        ctx.globalAlpha = 1;
+      }
+    }
+    // caja de la etiqueta CORTE (a la izquierda de la línea) para no pisarla con números de compás
+    const PILL_W = 50;
+    let pill = null;
+    if (cut != null && cut >= start && cut <= end) {
+      const xc = Math.round(this._xOf(cut));
+      const px = xc - PILL_W >= 0 ? xc - PILL_W + 1 : Math.min(xc, W - PILL_W);
+      pill = { x0: px - 3, x1: px + PILL_W + 1 };
+    }
+    const bars = this.bars;
+    if (bars.length) {
+      const barLen = bars.length > 1 ? (bars[bars.length - 1].start - bars[0].start) / (bars.length - 1) : span;
+      const pxPerBar = barLen * pxPerSec;
+      let every = 1;
+      while (pxPerBar * every < 26 && every < 1024) every *= 2;
+      const lineStep = pxPerBar >= 3 ? 1 : every;
+      ctx.font = '600 11px system-ui, -apple-system, "Segoe UI", Roboto, sans-serif';
+      ctx.textBaseline = 'middle';
+      ctx.textAlign = 'left';
+      const first = Math.max(0, lowerBoundBars(bars, start) - 1);
+      for (let i = first; i < bars.length; i++) {
+        const b = bars[i];
+        if (b.start > end) break;
+        if (b.start < start - barLen) continue;
+        const removed = cut != null && b.start >= cut - 1e-6;
+        const x = Math.round(this._xOf(b.start));
+        if ((b.number - 1) % lineStep === 0) {
+          ctx.globalAlpha = removed ? 0.45 : 1;
+          ctx.fillStyle = C.downbeat;
+          ctx.fillRect(x - 0.5, RULER_H - 6, 1.5, waveBot - RULER_H + 6);
+        }
+        if ((b.number - 1) % every === 0 && x >= -2 && x < W - 8) {
+          const label = String(b.number);
+          const lw = ctx.measureText(label).width;
+          if (!pill || x + 3 + lw < pill.x0 || x + 3 > pill.x1) {
+            ctx.globalAlpha = removed ? 0.5 : 1;
+            ctx.fillStyle = C.barnum;
+            ctx.fillText(label, x + 3, RULER_H / 2);
+          }
+        }
+      }
+      ctx.globalAlpha = 1;
+    }
+
+    // zona que se quita
+    if (cut != null && cut < end) {
+      const x0 = Math.max(0, this._xOf(cut));
+      ctx.fillStyle = C.dim;
+      ctx.fillRect(x0, 0, W - x0, H - TIME_H);
+      ctx.fillStyle = this._hatchPattern(ctx) || C.dim;
+      ctx.fillRect(x0, waveTop, W - x0, waveBot - waveTop);
+      const wReg = W - x0;
+      if (wReg > 70) {
+        ctx.font = '700 12px system-ui, -apple-system, "Segoe UI", Roboto, sans-serif';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        const lx = x0 + Math.min(wReg / 2, 80);
+        const label = 'Se quita';
+        const tw = ctx.measureText(label).width + 16;
+        ctx.fillStyle = C.bg;
+        ctx.globalAlpha = 0.85;
+        roundRect(ctx, lx - tw / 2, waveTop + 8, tw, 22, 11);
+        ctx.fill();
+        ctx.globalAlpha = 1;
+        ctx.fillStyle = C.text;
+        ctx.fillText(label, lx, waveTop + 19);
+      }
+    }
+
+    // fade: degradado + curva de ganancia
+    if (cut != null && fade > 0 && cut > start && fadeStart < end) {
+      const x0 = this._xOf(fadeStart);
+      const x1 = this._xOf(cut);
+      if (x1 - x0 > 1) {
+        const grad = ctx.createLinearGradient(x0, 0, x1, 0);
+        grad.addColorStop(0, 'rgba(0,0,0,0)');
+        grad.addColorStop(1, C.fade);
+        ctx.fillStyle = grad;
+        ctx.fillRect(x0, waveTop, x1 - x0, waveBot - waveTop);
+        ctx.strokeStyle = C.cut;
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        const steps = Math.max(8, Math.min(200, Math.round(x1 - x0)));
+        for (let k = 0; k <= steps; k++) {
+          const p = k / steps;
+          const g = this.gainFn ? clamp(this.gainFn(p), 0, 1) : 1 - p;
+          const x = x0 + (x1 - x0) * p;
+          const y = waveTop + 4 + (1 - g) * (waveBot - waveTop - 8);
+          if (k === 0) ctx.moveTo(x, y);
+          else ctx.lineTo(x, y);
+        }
+        ctx.stroke();
+      }
+    }
+
+    // tiempos en la franja inferior
+    this._drawTimeTicks(ctx, W, H, pxPerSec);
+
+    // cabezal
+    if (this.playhead >= start && this.playhead <= end) {
+      const x = Math.round(this._xOf(this.playhead));
+      ctx.fillStyle = C.playhead;
+      ctx.fillRect(x - 0.75, RULER_H, 1.5, H - RULER_H - TIME_H);
+      ctx.beginPath();
+      ctx.moveTo(x - 5, RULER_H);
+      ctx.lineTo(x + 5, RULER_H);
+      ctx.lineTo(x, RULER_H + 6);
+      ctx.closePath();
+      ctx.fill();
+    }
+
+    // marcador de corte con asa
+    if (cut != null && cut >= start && cut <= end) {
+      const x = Math.round(this._xOf(cut));
+      ctx.fillStyle = C.cut;
+      const lw = this._drag && this._drag.kind === 'cut' ? 3 : 2;
+      ctx.fillRect(x - lw / 2, 0, lw, H - TIME_H);
+      // la etiqueta va a la izquierda de la línea para no tapar el número del primer compás que se quita
+      const pw = PILL_W;
+      const px = x - pw >= 0 ? x - pw + 1 : Math.min(x, W - pw);
+      roundRect(ctx, px, 1, pw, RULER_H - 2, 6);
+      ctx.fill();
+      ctx.fillStyle = C.cutText;
+      ctx.font = '800 10px system-ui, -apple-system, "Segoe UI", Roboto, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText('CORTE', px + pw / 2, RULER_H / 2 + 0.5);
+      // asa inferior (para dedos)
+      ctx.fillStyle = C.cut;
+      const hy = waveBot - 12;
+      roundRect(ctx, x - 7, hy - 12, 14, 24, 7);
+      ctx.fill();
+      ctx.fillStyle = C.cutText;
+      ctx.fillRect(x - 3, hy - 5, 1.5, 10);
+      ctx.fillRect(x + 1.5, hy - 5, 1.5, 10);
+    }
+  }
+
+  _drawTimeTicks(ctx, W, H, pxPerSec) {
+    const C = this.colors;
+    let step = TICK_STEPS[TICK_STEPS.length - 1];
+    for (const s of TICK_STEPS) {
+      if (s * pxPerSec >= 80) {
+        step = s;
+        break;
+      }
+    }
+    const dec = step >= 1 ? 0 : step >= 0.1 ? 1 : 2;
+    ctx.font = '500 10px system-ui, -apple-system, "Segoe UI", Roboto, sans-serif';
+    ctx.textBaseline = 'middle';
+    ctx.textAlign = 'left';
+    ctx.fillStyle = C.text;
+    const { start, end } = this.view;
+    const first = Math.ceil(start / step - 1e-9) * step;
+    for (let t = first; t <= end + 1e-9; t += step) {
+      const x = Math.round(this._xOf(t));
+      ctx.fillRect(x, H - TIME_H, 1, 4);
+      if (x < W - 30) ctx.fillText(formatTime(t, dec), x + 3, H - TIME_H / 2 + 1);
+    }
+  }
+
+  _drawOverview() {
+    const cv = this.overview;
+    const ctx = cv.getContext('2d');
+    const dpr = this._dpr || 1;
+    const W = this._ow;
+    const H = this._oh;
+    const C = this.colors;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, W, H);
+    ctx.fillStyle = C.bg;
+    ctx.fillRect(0, 0, W, H);
+    if (!this.pyramid || !this.duration) return;
+    const cols = Math.max(1, Math.round(W * dpr));
+    const colW = W / cols;
+    // reutiliza el buffer de columnas sin pisar el de la vista principal
+    const saved = this._cols;
+    this._cols = this._ovCols;
+    const { lo, hi, rms } = this._columns(0, this.duration, cols);
+    this._ovCols = this._cols;
+    this._cols = saved;
+    const mid = H / 2;
+    const amp = (H / 2 - 3) * this.norm;
+    const cut = this.cutTime;
+    const cCut = cut != null ? clamp(Math.floor((cut / this.duration) * cols), 0, cols) : cols;
+    const pass = (x0, x1, color, useRms) => {
+      ctx.fillStyle = color;
+      for (let x = x0; x < x1; x++) {
+        if (useRms) {
+          const r = rms[x] * amp;
+          if (r > 0.3) ctx.fillRect(x * colW, mid - r, colW, 2 * r);
+        } else {
+          const top = mid - hi[x] * amp;
+          ctx.fillRect(x * colW, top, colW, Math.max(colW, (hi[x] - lo[x]) * amp));
+        }
+      }
+    };
+    pass(0, cCut, C.peak, false);
+    pass(0, cCut, C.rms, true);
+    pass(cCut, cols, C.removed, false);
+    pass(cCut, cols, C.removedRms, true);
+    const k = W / this.duration;
+    if (cut != null) {
+      ctx.fillStyle = C.dim;
+      ctx.fillRect(cut * k, 0, W - cut * k, H);
+    }
+    // ventana visible
+    const vx0 = this.view.start * k;
+    const vx1 = Math.max(vx0 + 3, this.view.end * k);
+    ctx.fillStyle = C.window;
+    ctx.fillRect(vx0, 0, vx1 - vx0, H);
+    ctx.strokeStyle = C.windowBorder;
+    ctx.lineWidth = 1.5;
+    ctx.strokeRect(vx0 + 0.75, 0.75, Math.max(1, vx1 - vx0 - 1.5), H - 1.5);
+    if (cut != null) {
+      ctx.fillStyle = C.cut;
+      ctx.fillRect(Math.round(cut * k) - 1, 0, 2, H);
+    }
+    ctx.fillStyle = C.playhead;
+    ctx.fillRect(Math.round(this.playhead * k), 0, 1, H);
+  }
+
+  // ---------- interacción ----------
+
+  _localX(e, el) {
+    const r = el.getBoundingClientRect();
+    return e.clientX - r.left;
+  }
+
+  _bindMain() {
+    const cv = this.main;
+    cv.addEventListener('pointerdown', (e) => this._onDown(e));
+    cv.addEventListener('pointermove', (e) => this._onMove(e));
+    cv.addEventListener('pointerup', (e) => this._onUp(e, false));
+    cv.addEventListener('pointercancel', (e) => this._onUp(e, true));
+    cv.addEventListener('pointerleave', (e) => {
+      if (e.pointerType === 'mouse' && !this._pointers.size) this._setHover(false);
+    });
+    cv.addEventListener('wheel', (e) => this._onWheel(e), { passive: false });
+    cv.addEventListener('contextmenu', (e) => {
+      if (this._drag) e.preventDefault();
+    });
+  }
+
+  _nearCut(x, pointerType) {
+    if (this.cutTime == null) return false;
+    const tol = pointerType === 'mouse' ? 8 : 22;
+    return Math.abs(x - this._xOf(this.cutTime)) <= tol;
+  }
+
+  _setHover(on) {
+    if (on === this._hoverCut) return;
+    this._hoverCut = on;
+    this.main.style.cursor = on ? 'ew-resize' : '';
+  }
+
+  _onDown(e) {
+    if (!this.duration) return;
+    if (e.pointerType === 'mouse' && e.button !== 0) return;
+    e.preventDefault();
+    this._lastInteraction = performance.now();
+    try {
+      this.main.setPointerCapture(e.pointerId);
+    } catch {
+      // puntero ya liberado
+    }
+    const x = this._localX(e, this.main);
+    this._pointers.set(e.pointerId, { x });
+    if (this._pointers.size === 2) {
+      // pellizco: cancela arrastre/paneo y hace zoom + paneo con dos dedos
+      if (this._drag && this._drag.kind === 'cut') this._emitCut(this.cutTime, false, -1, 'end');
+      const [a, b] = [...this._pointers.values()];
+      const midX = (a.x + b.x) / 2;
+      this._drag = {
+        kind: 'pinch',
+        d0: Math.max(12, Math.abs(a.x - b.x)),
+        anchor: this._tOf(midX),
+        span0: this.view.end - this.view.start,
+      };
+      return;
+    }
+    if (this._pointers.size > 2) return;
+    if (this._nearCut(x, e.pointerType)) {
+      this._drag = { kind: 'cut', id: e.pointerType, offset: x - this._xOf(this.cutTime) };
+      this._emitCut(this.cutTime, false, -1, 'start');
+      this.invalidate();
+    } else {
+      this._drag = { kind: 'tap', x0: x, view0: { ...this.view } };
+    }
+  }
+
+  _onMove(e) {
+    const x = this._localX(e, this.main);
+    if (!this._pointers.has(e.pointerId)) {
+      if (e.pointerType === 'mouse') this._setHover(this._nearCut(x, 'mouse'));
+      return;
+    }
+    this._pointers.get(e.pointerId).x = x;
+    const d = this._drag;
+    if (!d) return;
+    this._lastInteraction = performance.now();
+    if (d.kind === 'pinch') {
+      const pts = [...this._pointers.values()];
+      if (pts.length < 2) return;
+      const dist = Math.max(12, Math.abs(pts[0].x - pts[1].x));
+      const midX = (pts[0].x + pts[1].x) / 2;
+      const span = clamp((d.span0 * d.d0) / dist, this._minSpan(), this.duration);
+      const s = d.anchor - (midX / this._w) * span;
+      this.setView(s, s + span);
+      return;
+    }
+    if (d.kind === 'cut') {
+      const raw = clamp(this._tOf(x - d.offset), 0.05, this.duration);
+      let t = raw;
+      let snapped = false;
+      let idx = -1;
+      const free = e.altKey || e.shiftKey || !this.snap;
+      if (!free && this.beats.length) {
+        const tolPx = e.pointerType === 'mouse' ? 10 : 18;
+        const secPerPx = (this.view.end - this.view.start) / this._w;
+        const s = snapToBeat(this.beats, raw, tolPx * secPerPx);
+        t = s.time;
+        snapped = s.snapped;
+        idx = s.snapped ? s.index : -1;
+      }
+      this.cutTime = t;
+      this._emitCut(t, snapped, idx, 'move', raw);
+      this.invalidate();
+      return;
+    }
+    if (d.kind === 'tap' && Math.abs(x - d.x0) > 6) {
+      d.kind = 'pan';
+      this.main.style.cursor = 'grabbing';
+    }
+    if (d.kind === 'pan') {
+      const span = d.view0.end - d.view0.start;
+      const dt = ((x - d.x0) / this._w) * span;
+      this.setView(d.view0.start - dt, d.view0.end - dt);
+    }
+  }
+
+  _onUp(e, cancelled) {
+    if (!this._pointers.has(e.pointerId)) return;
+    const x = this._localX(e, this.main);
+    this._pointers.delete(e.pointerId);
+    const d = this._drag;
+    if (!d) return;
+    if (d.kind === 'pinch') {
+      if (this._pointers.size === 1) {
+        // sigue paneando con el dedo que queda
+        const [p] = [...this._pointers.values()];
+        this._drag = { kind: 'pan', x0: p.x, view0: { ...this.view } };
+      } else if (!this._pointers.size) {
+        this._drag = null;
+      }
+      return;
+    }
+    if (this._pointers.size) return;
+    this._drag = null;
+    this.main.style.cursor = this._hoverCut ? 'ew-resize' : '';
+    if (d.kind === 'cut') {
+      this._emitCut(this.cutTime, this._lastSnap || false, this._lastSnapIdx ?? -1, 'end');
+      this.invalidate();
+    } else if (d.kind === 'tap' && !cancelled) {
+      const t = clamp(this._tOf(x), 0, this.duration);
+      this.dispatchEvent(new CustomEvent('seek', { detail: { time: t } }));
+    }
+  }
+
+  _emitCut(time, snapped, beatIndex, phase, rawTime = time) {
+    if (phase === 'move') {
+      this._lastSnap = snapped;
+      this._lastSnapIdx = beatIndex;
+    } else if (phase === 'start') {
+      this._lastSnap = false;
+      this._lastSnapIdx = -1;
+    }
+    this.dispatchEvent(new CustomEvent('cutchange', { detail: { time, rawTime, snapped, beatIndex, phase } }));
+  }
+
+  _onWheel(e) {
+    if (!this.duration) return;
+    e.preventDefault();
+    this._lastInteraction = performance.now();
+    const unit = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? this._h : 1;
+    let dx = e.deltaX * unit;
+    let dy = e.deltaY * unit;
+    if (e.shiftKey && !dx) {
+      dx = dy;
+      dy = 0;
+    }
+    const x = this._localX(e, this.main);
+    if (Math.abs(dx) > Math.abs(dy)) {
+      const span = this.view.end - this.view.start;
+      const dt = (dx / this._w) * span;
+      this.setView(this.view.start + dt, this.view.end + dt);
+    } else if (dy) {
+      const k = e.ctrlKey ? 0.01 : 0.0022;
+      this.zoomBy(Math.exp(clamp(dy, -300, 300) * k), this._tOf(x));
+    }
+  }
+
+  _bindOverview() {
+    const cv = this.overview;
+    const jump = (e) => {
+      const x = this._localX(e, cv);
+      const t = clamp((x / this._ow) * this.duration, 0, this.duration);
+      this._lastInteraction = performance.now();
+      this.centerOn(t);
+    };
+    cv.addEventListener('pointerdown', (e) => {
+      if (!this.duration) return;
+      if (e.pointerType === 'mouse' && e.button !== 0) return;
+      e.preventDefault();
+      try {
+        cv.setPointerCapture(e.pointerId);
+      } catch {
+        // sin captura
+      }
+      this._ovDrag = e.pointerId;
+      jump(e);
+    });
+    cv.addEventListener('pointermove', (e) => {
+      if (this._ovDrag === e.pointerId) jump(e);
+    });
+    const end = (e) => {
+      if (this._ovDrag === e.pointerId) this._ovDrag = null;
+    };
+    cv.addEventListener('pointerup', end);
+    cv.addEventListener('pointercancel', end);
+  }
+}
+
+function lowerBoundBars(bars, t) {
+  let lo = 0;
+  let hi = bars.length;
+  while (lo < hi) {
+    const m = (lo + hi) >> 1;
+    if (bars[m].start < t) lo = m + 1;
+    else hi = m;
+  }
+  return lo;
+}
+
+function roundRect(ctx, x, y, w, h, r) {
+  const rr = Math.min(r, w / 2, h / 2);
+  ctx.beginPath();
+  ctx.moveTo(x + rr, y);
+  ctx.lineTo(x + w - rr, y);
+  ctx.arcTo(x + w, y, x + w, y + rr, rr);
+  ctx.lineTo(x + w, y + h - rr);
+  ctx.arcTo(x + w, y + h, x + w - rr, y + h, rr);
+  ctx.lineTo(x + rr, y + h);
+  ctx.arcTo(x, y + h, x, y + h - rr, rr);
+  ctx.lineTo(x, y + rr);
+  ctx.arcTo(x, y, x + rr, y, rr);
+  ctx.closePath();
+}

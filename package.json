@@ -6,6 +6,7 @@
   "type": "module",
   "scripts": {
     "test": "node --test \"tests/**/*.test.js\"",
+    "e2e": "node tests/e2e/app.e2e.mjs",
     "bench": "node tools/bench.js",
     "serve": "npx --yes http-server -c-1 -p 8080 ."
   },
