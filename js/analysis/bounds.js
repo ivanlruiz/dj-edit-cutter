@@ -10,6 +10,10 @@ export const BOUNDS_DEFAULTS = {
   minActiveSec: 0.03, // actividad sostenida para contar (ignora clics aislados)
 };
 
+/**
+ * RMS en ventanas de `windowSec` (salto `hopSec`) sin componente continua: desviación típica de las muestras de la
+ * ventana (un offset DC no cuenta como música; nunca supera al RMS normal, así que el silencio sigue siendo silencio).
+ */
 function windowRms(samples, sampleRate, windowSec, hopSec) {
   const win = Math.max(1, Math.round(windowSec * sampleRate));
   const hop = Math.max(1, Math.round(hopSec * sampleRate));
@@ -18,10 +22,16 @@ function windowRms(samples, sampleRate, windowSec, hopSec) {
   const rms = new Float32Array(nW);
   for (let w = 0; w < nW; w++) {
     const o = w * hop;
-    let s = 0;
     const end = Math.min(n, o + win);
-    for (let i = o; i < end; i++) s += samples[i] * samples[i];
-    rms[w] = Math.sqrt(s / win);
+    let s = 0;
+    let s2 = 0;
+    for (let i = o; i < end; i++) {
+      const v = samples[i];
+      s += v;
+      s2 += v * v;
+    }
+    const cnt = end - o;
+    rms[w] = cnt > 0 ? Math.sqrt(Math.max(0, s2 - (s * s) / cnt) / win) : 0;
   }
   return { rms, win, hop };
 }
@@ -33,7 +43,7 @@ function median(arr) {
 }
 
 /**
- * Inicio y fin de la música: RMS en ventanas de 20 ms (salto 10 ms) por encima de máximo − 50 dB.
+ * Inicio y fin de la música: RMS en ventanas de 20 ms (salto 10 ms, sin DC) por encima de máximo − 50 dB.
  * Si hay ruido de fondo en los extremos, el umbral sube a ruido + 10 dB (tope −35 dB). Se exige actividad
  * sostenida (≥ 30 ms en 50 ms) para que un clic aislado no cuente.
  * @returns {{ musicStart:number, musicEnd:number, thresholdDb:number, noiseFloorDb:number, peakRms:number }}
@@ -84,51 +94,262 @@ export function findMusicBounds(samples, sampleRate, opts = {}) {
 export const LAST_ONSET_DEFAULTS = {
   relHeight: 0.2, // altura mínima del pico relativa al percentil 75 de los picos de la canción
   minLevelDb: -38, // RMS tras el onset relativo al máximo RMS de la canción
-  minRiseDb: 1.5, // la energía tiene que subir (no vale un pico dentro de una cola que decae)
   minContrast: 3, // altura >= minContrast × media de la envolvente en el segundo previo
   contrastSec: 1,
+  contextSec: 4, // contexto: el pico más alto de los contextSec previos (el golpe final, si estamos en su cola)
+  minContextRel: 0.08, // altura >= 8 % de ese pico (fluctuaciones de la cola de un golpe mucho más fuerte no cuentan)
+  // ataque (vale cualquiera de las tres; no vale un pico dentro de una cola que decae):
+  minRiseDb: 1.5, // a) el RMS total sube frente a los 40 ms previos
+  minHighRiseDb: 6, // b) … o sube el RMS de la banda > 2 kHz (con un limitador el total queda plano, los agudos no)
+  highRiseContrast: 5, //    con contraste >= 5 (en la cola saturada de un platillo los agudos también fluctúan)
+  strongContrast: 5, // c) … o es un onset claramente fuerte: contraste >= strongContrast,
+  strongRel: 0.5, //       altura >= strongRel × el pico más alto del contexto
+  strongLevelDb: -12, //   y nivel >= máximo − 12 dB (acorde de piano o pad + voz sin subida de nivel en un master
+  //                        limitado; en la cola de un golpe más fuerte no pasa: el golpe queda en el contexto)
   pick: { threshold: 0.02, relThreshold: 0.5 }, // selección de picos más permisiva que la de detectOnsets
+  noise: null, // opciones de findNoiseTail (se mezclan con NOISE_TAIL_DEFAULTS); false = sin zona de ruido
 };
+
+/**
+ * Zona de ruido final (aplausos y público en una grabación en directo): cada palmada es un onset con ataque, así
+ * que sin esto el "último onset" cae segundos después del golpe final. Se marca un punto de la rejilla (cada `step`
+ * s) cuando el sonido es ruido de banda ancha (planitud media en ±flatHalf s >= minFlatness), con onsets densos
+ * (>= minDensity picos/s en ±densHalf s) y sin pulso (ACF normalizada de onset + ½ onsetLow en una ventana de
+ * periodWin s, máximo en retardos de 0.25–1.5 s, < maxPeriodicity), y la racha suena más baja que la música.
+ * Medido con palmas sintéticas (aplauso de −2 a −32 dB respecto a la música) frente a las suites, sus variantes
+ * masterizadas y 5 clips reales: la música con batería tiene pulso, los pads, la voz y las baladas no son planos y la
+ * resonancia de un platillo no tiene onsets densos.
+ */
+export const NOISE_TAIL_DEFAULTS = {
+  step: 0.25,
+  flatHalf: 0.5,
+  minFlatness: 0.6, // (el final de unas cuerdas reales, denso y en ritardando, llega a 0.5)
+  densHalf: 0.75,
+  minDensity: 5,
+  periodWin: 3,
+  maxPeriodicity: 0.35,
+  maxLevelDb: -4, // RMS mediano de la racha <= RMS mediano de la música anterior + maxLevelDb: el aplauso suena
+  //                 por debajo de la banda (−7 dB o menos en el 90 % de los casos medidos); un final de rock libre
+  //                 con platillos y redobles, que también es denso y sin pulso, suena igual o más fuerte
+  maxGap: 1.5, // s sin marcar dentro de la racha
+  minRun: 1, // s de racha mínima de ruido de banda ancha…
+  minTotal: 2, // … o de racha total contando la extensión por puntos densos y sin pulso (palmas bajo un acorde largo)
+  tailSlack: 2.5, // el último punto de la racha, a menos de esto antes del último pico (la racha llega al final)
+  weakExtend: true, // hacia atrás la zona sigue por puntos sin pulso que son densos o planos (planitud >=
+  //                   extendFlatness: las primeras palmas, bajo el acorde final que resuena), con huecos de hasta
+  extendFlatness: 0.5, // maxGap s…
+  maxExtend: 3, //     … como mucho maxExtend s antes de la racha…
+  extendDropDb: 18, //  … y sin bajar más de esto respecto al nivel de la racha (silencio o ruido de sala = corte)
+  margin: 0.4, // s: la zona empieza esto antes del primer punto marcado (las ventanas de los puntos lo cubren casi)
+  outstanding: 4, // dentro de la zona sólo cuenta un onset >= outstanding × P75 de los picos (desde la racha). Medido:
+  //                 golpe final >= 5.0× y palmas <= 3.2× en todos los casos con aplauso sintético
+};
+
+/** Máximo de la ACF normalizada (sin media) de env en [c − win/2, c + win/2] para retardos de lagLo a lagHi s. */
+function periodicityAt(env, fps, c, win, lagLo = 0.25, lagHi = 1.5) {
+  const a = Math.max(0, Math.round(c - (win * fps) / 2));
+  const b = Math.min(env.length, Math.round(c + (win * fps) / 2));
+  const n = b - a;
+  if (n < 20) return 0;
+  let m = 0;
+  for (let i = a; i < b; i++) m += env[i];
+  m /= n;
+  let r0 = 0;
+  for (let i = a; i < b; i++) r0 += (env[i] - m) * (env[i] - m);
+  if (!(r0 > 0)) return 0;
+  let best = 0;
+  for (let L = Math.round(lagLo * fps); L <= Math.min(n - 10, Math.round(lagHi * fps)); L++) {
+    let s = 0;
+    for (let i = a; i + L < b; i++) s += (env[i] - m) * (env[i + L] - m);
+    const v = ((s / r0) * n) / (n - L);
+    if (v > best) best = v;
+  }
+  return best;
+}
+
+/**
+ * Zona de ruido al final de la canción (aplausos): racha de puntos marcados (ver NOISE_TAIL_DEFAULTS) que llega
+ * hasta el último pico de onset. Hace falta features.flatness.
+ * @param {number[]} [peaks] picos de onset (índices de trama, ascendentes) hasta musicEnd; si faltan se calculan
+ * @returns {{ start:number, coreStart:number, end:number, peakRef:number, minHeight:number } | null} tiempos en s:
+ *   start = inicio de la zona (con margen), coreStart = inicio de la racha de ruido de banda ancha, end = último punto
+ *   marcado; peakRef = P75 de la altura de los picos (features.onset) desde la racha; minHeight = outstanding × peakRef
+ *   (altura mínima de un onset de verdad dentro de la zona). null si no hay zona de ruido.
+ */
+export function findNoiseTail(features, musicEnd, opts = {}, peaks = null) {
+  const o = { ...NOISE_TAIL_DEFAULTS, ...(opts || {}) };
+  const { onset, onsetLow, flatness, rms, fps, numFrames } = features;
+  if (!flatness || !onset || !(fps > 0)) return null;
+  const endFrame = Math.min(numFrames - 1, Math.floor((musicEnd + 0.02) * fps));
+  const pk = peaks || pickPeaks(onset, fps, LAST_ONSET_DEFAULTS.pick).filter((i) => i <= endFrame);
+  if (pk.length < 8) return null;
+  const env = new Float32Array(numFrames);
+  for (let i = 0; i < numFrames; i++) env[i] = onset[i] + 0.5 * (onsetLow ? onsetLow[i] : 0);
+  // primer índice de pk con trama >= f
+  const lower = (f) => {
+    let lo = 0;
+    let hi = pk.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (pk[mid] < f) lo = mid + 1;
+      else hi = mid;
+    }
+    return lo;
+  };
+  const fh = Math.round(o.flatHalf * fps);
+  const dh = o.densHalf * fps;
+  // marca de un punto: DENSE | FLAT si no tiene pulso (0 si lo tiene o no es ni denso ni plano); ruido de banda
+  // ancha = las dos. Al principio del aplauso el acorde final aún tapa la planitud o las palmas aún no son densas
+  const DENSE = 1;
+  const FLAT = 2; // planitud >= minFlatness
+  const SOFT = 4; // planitud >= extendFlatness (sólo para extender la zona)
+  const memo = new Map();
+  const mark = (t) => {
+    const c = Math.round(t * fps);
+    if (memo.has(c)) return memo.get(c);
+    const m = markAt(c);
+    memo.set(c, m);
+    return m;
+  };
+  const markAt = (c) => {
+    const dense = (lower(c + dh + 1e-9) - lower(c - dh)) / (2 * o.densHalf) >= o.minDensity;
+    let s = 0;
+    let n = 0;
+    for (let i = Math.max(0, c - fh); i <= Math.min(numFrames - 1, c + fh); i++) {
+      s += flatness[i];
+      n++;
+    }
+    const fm = n > 0 ? s / n : 0;
+    const flat = fm >= o.minFlatness;
+    const soft = fm >= Math.min(o.minFlatness, o.extendFlatness);
+    if (!dense && !soft) return 0;
+    if (periodicityAt(env, fps, c, o.periodWin) >= o.maxPeriodicity) return 0;
+    return (dense ? DENSE : 0) | (flat ? FLAT : 0) | (soft ? SOFT : 0);
+  };
+  const noise = (t) => (mark(t) & (DENSE | FLAT)) === (DENSE | FLAT);
+  const lastPeak = pk[pk.length - 1] / fps;
+  let end = -1;
+  for (let t = lastPeak; t >= Math.max(0, lastPeak - o.tailSlack); t -= o.step) {
+    if (noise(t)) {
+      end = t;
+      break;
+    }
+  }
+  if (end < 0) return null;
+  let core = end;
+  for (let t = end - o.step; t >= 0; t -= o.step) {
+    if (noise(t)) core = t;
+    else if (core - t > o.maxGap) break;
+  }
+  // racha válida: minRun s de ruido de banda ancha, o minTotal s contando los puntos densos y sin pulso de antes
+  let dense = core;
+  while (dense - o.step >= 0 && mark(dense - o.step) & DENSE) dense -= o.step;
+  if (end - core < o.minRun && end - dense < o.minTotal) return null;
+  // nivel: la racha suena por debajo de la música de antes (frames no silenciosos, a < 60 dB del máximo)
+  const medianOf = (arr) => {
+    arr.sort((x, y) => x - y);
+    return arr.length ? arr[arr.length >> 1] : 0;
+  };
+  const coreLevel = rms ? medianOf(Array.from(rms.subarray(Math.round(core * fps), Math.min(numFrames, Math.round(end * fps) + 1)))) : 0;
+  if (Number.isFinite(o.maxLevelDb) && rms) {
+    let mx = 0;
+    for (let i = 0; i < numFrames; i++) if (rms[i] > mx) mx = rms[i];
+    const before = [];
+    for (let i = 0; i < Math.min(numFrames, Math.round(core * fps)); i++) if (rms[i] > mx * 1e-3) before.push(rms[i]);
+    if (before.length && coreLevel > 0 && 20 * Math.log10(coreLevel / medianOf(before)) > o.maxLevelDb) return null;
+  }
+  // inicio de la zona: hacia atrás por puntos sin pulso densos o planos (con huecos de hasta maxGap s) que suenan a
+  // menos de extendDropDb por debajo de la racha (un silencio o el ruido de sala entre el final y el aplauso cortan)
+  const minLevel = coreLevel * Math.pow(10, -o.extendDropDb / 20);
+  const loud = (t) => {
+    if (!rms) return true;
+    const c = Math.round(t * fps);
+    let m = 0;
+    for (let i = Math.max(0, c - fh); i <= Math.min(numFrames - 1, c + fh); i++) m = Math.max(m, rms[i]);
+    return m >= minLevel;
+  };
+  let start = core;
+  if (o.weakExtend) {
+    for (let t = core - o.step; t >= Math.max(0, core - o.maxExtend); t -= o.step) {
+      if (!loud(t)) break;
+      if (mark(t)) start = t;
+      else if (start - t > o.maxGap) break;
+    }
+  }
+  // altura típica de las palmas: picos desde el inicio de la racha densa hasta el último pico
+  const h = [];
+  for (let k = lower(Math.round(Math.min(core, dense) * fps)); k < pk.length; k++) h.push(onset[pk[k]]);
+  if (h.length < 4) return null;
+  h.sort((x, y) => x - y);
+  const peakRef = h[Math.floor(0.75 * (h.length - 1))];
+  return { start: Math.max(0, start - o.margin), coreStart: core, end, peakRef, minHeight: o.outstanding * peakRef };
+}
 
 /**
  * Último onset significativo (golpe final / última nota tocada) antes de musicEnd.
  * Criterios: pico de features.onset (pickPeaks con opts.pick) con altura >= relHeight × P75(alturas de picos),
- * nivel RMS tras el onset >= máximo + minLevelDb, subida de energía >= minRiseDb frente a los 40 ms previos y
- * contraste >= minContrast frente a la media de la envolvente en el segundo previo (evita colas con batidos).
+ * nivel RMS tras el onset (80 ms) >= máximo + minLevelDb, contraste >= minContrast frente a la media de la envolvente
+ * en el segundo previo (evita colas con batidos), altura >= minContextRel × el pico más alto de los contextSec previos
+ * y un ataque: subida del RMS total >= minRiseDb frente a 40 ms antes, o subida del RMS > 2 kHz (features.rmsHigh)
+ * >= minHighRiseDb con contraste >= highRiseContrast, o un onset fuerte (contraste >= strongContrast, altura >=
+ * strongRel × el pico más alto del contexto, nivel >= máximo + strongLevelDb). Las dos últimas vías hacen falta en
+ * masters muy limitados o saturados (el nivel total no sube en el golpe final) y en acordes finales de ataque lento
+ * (pad + voz: el RMS tampoco sube en 250 ms, los agudos sí). Medido con tools/bench.js --analyze (limit12 / clip4 /
+ * clip8); el contexto evita que la cola de un acorde final (balada con pad) cuente como último onset.
  * @returns {number} segundos (o musicEnd si no hay ningún onset significativo; 0 si la señal es silencio)
  */
 export function findLastOnset(features, musicEnd, opts = {}) {
   const o = { ...LAST_ONSET_DEFAULTS, ...opts };
   const { onset, rms, fps, numFrames } = features;
+  const high = features.rmsHigh || null;
   const endFrame = Math.min(numFrames - 1, Math.floor((musicEnd + 0.02) * fps));
   const peaks = pickPeaks(onset, fps, o.pick).filter((i) => i <= endFrame);
   if (!peaks.length) return Math.max(0, musicEnd);
+  // aplausos al final: sus palmas no cuentan (sólo un golpe muy por encima de ellas)
+  const zone = o.noise === false ? null : findNoiseTail(features, musicEnd, o.noise, peaks);
+  const zoneFrom = zone ? Math.ceil(zone.start * fps) : Infinity;
+  const zoneMin = zone ? zone.minHeight : 0;
   const heights = peaks.map((i) => onset[i]).sort((a, b) => a - b);
   const p75 = heights[Math.floor(0.75 * (heights.length - 1))];
   let maxRms = 0;
   for (let i = 0; i < numFrames; i++) if (rms[i] > maxRms) maxRms = rms[i];
   const levelTh = maxRms * Math.pow(10, o.minLevelDb / 20);
+  const strongLevelTh = maxRms * Math.pow(10, o.strongLevelDb / 20);
   const after = Math.max(1, Math.round(0.08 * fps));
   const before = Math.max(1, Math.round(0.04 * fps));
   const riseFactor = Math.pow(10, o.minRiseDb / 20);
+  const highRiseFactor = Math.pow(10, o.minHighRiseDb / 20);
   const ctxFrames = Math.round(o.contrastSec * fps);
   const gapFrames = Math.max(1, Math.round(0.05 * fps));
+  const contextFrames = Math.round(o.contextSec * fps);
+  const postMax = (env, i) => {
+    let m = 0;
+    for (let j = i; j <= Math.min(numFrames - 1, i + after); j++) if (env[j] > m) m = env[j];
+    return m;
+  };
   for (let k = peaks.length - 1; k >= 0; k--) {
     const i = peaks[k];
+    if (i >= zoneFrom && onset[i] < zoneMin) continue;
     if (onset[i] < o.relHeight * p75) continue;
-    let post = 0;
-    for (let j = i; j <= Math.min(numFrames - 1, i + after); j++) if (rms[j] > post) post = rms[j];
+    const post = postMax(rms, i);
     if (post < levelTh) continue;
-    const pre = rms[Math.max(0, i - before)];
-    if (post < pre * riseFactor) continue;
     // contraste con la envolvente del último segundo (en colas sostenidas con batidos todo es "ruido de flujo")
     const c0 = Math.max(0, i - ctxFrames);
     const c1 = Math.max(c0 + 1, i - gapFrames);
     let m = 0;
     for (let j = c0; j < c1; j++) m += onset[j];
     m /= c1 - c0;
-    if (onset[i] < o.minContrast * m) continue;
-    return i / fps;
+    const contrast = m > 0 ? onset[i] / m : Infinity;
+    if (contrast < o.minContrast) continue;
+    let ctxMax = 0;
+    for (let j = Math.max(0, i - contextFrames); j < i - gapFrames; j++) if (onset[j] > ctxMax) ctxMax = onset[j];
+    if (onset[i] < o.minContextRel * ctxMax) continue;
+    // ataque
+    const pre = rms[Math.max(0, i - before)];
+    let attack = post >= pre * riseFactor;
+    if (!attack && high && contrast >= o.highRiseContrast) attack = postMax(high, i) >= high[Math.max(0, i - before)] * highRiseFactor;
+    if (!attack && contrast >= o.strongContrast && post >= strongLevelTh) attack = onset[i] >= o.strongRel * ctxMax;
+    if (attack) return i / fps;
   }
   return Math.max(0, musicEnd);
 }

@@ -1,5 +1,6 @@
 // Vista de forma de onda (canvas): tira de resumen + vista con zoom, cuadrícula de beats/compases,
-// marcador de corte arrastrable, fade, zona que se quita y cabezal de reproducción.
+// marcador de corte arrastrable, fade, zona que se quita, trozos que quita o repite el cambio de compás
+// y cabezal de reproducción.
 // Las funciones puras exportadas (picos, imán, zoom) se prueban en Node.
 
 import { clamp, nearestIndex, lowerBound, formatTime } from './format.js';
@@ -88,6 +89,18 @@ export function clampView(start, end, duration, minSpan = MIN_VIEW_SPAN) {
 }
 
 // Zoom manteniendo `anchor` (s) en el mismo sitio de la pantalla; factor < 1 acerca
+// Gesto de un dedo/ratón que empezó como toque: 'pan' si se mueve en horizontal, 'cancel' si se mueve en vertical
+// (el usuario quiere desplazar la página: ni paneo ni salto del cabezal), 'tap' mientras siga casi quieto.
+export const PAN_START_PX = 6;
+export const SCROLL_CANCEL_PX = 8;
+export function classifyTapMove(dx, dy) {
+  const ax = Math.abs(dx);
+  const ay = Math.abs(dy);
+  if (ax > PAN_START_PX && ax >= ay) return 'pan';
+  if (ay > SCROLL_CANCEL_PX) return 'cancel';
+  return 'tap';
+}
+
 export function zoomView(view, factor, anchor, duration, minSpan = MIN_VIEW_SPAN) {
   const span = view.end - view.start;
   if (!(span > 0)) return clampView(0, duration, duration, minSpan);
@@ -98,6 +111,13 @@ export function zoomView(view, factor, anchor, duration, minSpan = MIN_VIEW_SPAN
 }
 
 const RULER_H = 20; // franja superior con números de compás
+export const PILL_W = 50; // ancho de la etiqueta CORTE
+
+// x de la etiqueta CORTE: a la derecha de la línea (sobre la zona que se quita) si cabe; si no, a la izquierda
+export function cutPillX(xCut, width) {
+  if (xCut + PILL_W <= width) return Math.max(0, xCut - 1);
+  return Math.max(0, xCut - PILL_W + 1);
+}
 const TIME_H = 16; // franja inferior con tiempos
 const TICK_STEPS = [0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600];
 
@@ -107,6 +127,8 @@ const COLOR_VARS = {
   beat: '--wf-beat', downbeat: '--wf-downbeat', barnum: '--wf-barnum', text: '--wf-text',
   cut: '--wf-cut', cutText: '--wf-cut-text', fade: '--wf-fade', playhead: '--wf-playhead',
   window: '--wf-window', windowBorder: '--wf-window-border', center: '--wf-center',
+  meterRemoved: '--wf-meter-removed', meterHatch: '--wf-meter-hatch', meterRepeat: '--wf-meter-repeat',
+  meterRepeatEdge: '--wf-meter-repeat-edge',
 };
 
 const FALLBACK_COLORS = {
@@ -115,7 +137,30 @@ const FALLBACK_COLORS = {
   beat: 'rgba(255,255,255,0.14)', downbeat: 'rgba(255,255,255,0.55)', barnum: '#d6e6f5', text: '#7f90a3',
   cut: '#ff6a3d', cutText: '#1a0a04', fade: 'rgba(255,106,61,0.30)', playhead: '#ffffff',
   window: 'rgba(98,227,255,0.14)', windowBorder: '#62e3ff', center: 'rgba(255,255,255,0.08)',
+  meterRemoved: 'rgba(255,77,77,0.30)', meterHatch: 'rgba(255,120,120,0.75)', meterRepeat: 'rgba(61,220,151,0.26)',
+  meterRepeatEdge: '#3ddc97',
 };
+
+// Primer índice de una lista de tramos { start, end } (ordenada) cuyo final es > t
+export function firstSliceEndingAfter(slices, t) {
+  let lo = 0;
+  let hi = slices.length;
+  while (lo < hi) {
+    const m = (lo + hi) >> 1;
+    if (slices[m].end <= t) lo = m + 1;
+    else hi = m;
+  }
+  return lo;
+}
+
+// Tramos que se ven en [t0, t1]: índices [i0, i1)
+export function visibleSlices(slices, t0, t1) {
+  if (!slices || !slices.length) return [0, 0];
+  const i0 = firstSliceEndingAfter(slices, t0);
+  let i1 = i0;
+  while (i1 < slices.length && slices[i1].start < t1) i1++;
+  return [i0, i1];
+}
 
 export class WaveformView extends EventTarget {
   constructor(root, { overviewHeight = 44 } = {}) {
@@ -140,6 +185,9 @@ export class WaveformView extends EventTarget {
     this.norm = 1;
     this.beats = [];
     this.bars = [];
+    this.lastBarIndex = -1;
+    this.meterRemoved = [];
+    this.meterRepeated = [];
     this.cutTime = null;
     this.fadeSec = 0;
     this.gainFn = null;
@@ -148,11 +196,13 @@ export class WaveformView extends EventTarget {
     this.view = { start: 0, end: 0 };
     this.colors = { ...FALLBACK_COLORS };
     this._hatch = null;
+    this._hatchRed = null;
     this._dirty = true;
     this._raf = 0;
     this._pointers = new Map();
     this._drag = null;
     this._ovDrag = null;
+    this._gesture = false; // pellizco de trackpad en Safari (gesturestart … gestureend)
     this._lastInteraction = 0;
     this._hoverCut = false;
     this._cols = null;
@@ -195,6 +245,9 @@ export class WaveformView extends EventTarget {
       this.view = { start: 0, end: 0 };
       this.beats = [];
       this.bars = [];
+      this.lastBarIndex = -1;
+      this.meterRemoved = [];
+      this.meterRepeated = [];
       this.cutTime = null;
       this.fadeSec = 0;
       this.playhead = 0;
@@ -203,10 +256,19 @@ export class WaveformView extends EventTarget {
     this.invalidate();
   }
 
-  // beats: tiempos (s); bars: [{ start, number }] (p. ej. getBars(result))
-  setGrid({ beats = [], bars = [] } = {}) {
+  // beats: tiempos (s); bars: [{ start, number, index }] (p. ej. getBars(result)); lastBarIndex: último compás que
+  // cuenta (el del golpe final): los de la cola que resuena no llevan número. -1 = todos.
+  setGrid({ beats = [], bars = [], lastBarIndex = -1 } = {}) {
     this.beats = beats;
     this.bars = bars;
+    this.lastBarIndex = Number.isInteger(lastBarIndex) ? lastBarIndex : -1;
+    this.invalidate();
+  }
+
+  // Cambio de compás: tramos que se quitan (rayado rojo) y que se repiten (verde), ordenados. null = ninguno.
+  setMeterEdit(edit) {
+    this.meterRemoved = (edit && edit.removed) || [];
+    this.meterRepeated = (edit && edit.repeated) || [];
     this.invalidate();
   }
 
@@ -323,10 +385,15 @@ export class WaveformView extends EventTarget {
       this.colors[k] = val || FALLBACK_COLORS[k];
     }
     this._hatch = null;
+    this._hatchRed = null;
   }
 
   _resize() {
     const dpr = Math.max(1, Math.min(3, window.devicePixelRatio || 1));
+    if (dpr !== this._dpr) {
+      this._hatch = null;
+      this._hatchRed = null;
+    }
     this._dpr = dpr;
     for (const cv of [this.overview, this.main]) {
       const r = cv.getBoundingClientRect();
@@ -358,13 +425,22 @@ export class WaveformView extends EventTarget {
   }
 
   _hatchPattern(ctx) {
-    if (this._hatch) return this._hatch;
+    if (!this._hatch) this._hatch = this._makeHatch(ctx, this.colors.hatch, 10);
+    return this._hatch;
+  }
+
+  _redHatchPattern(ctx) {
+    if (!this._hatchRed) this._hatchRed = this._makeHatch(ctx, this.colors.meterHatch, 6);
+    return this._hatchRed;
+  }
+
+  _makeHatch(ctx, color, size) {
     const c = document.createElement('canvas');
-    const s = Math.round(10 * (this._dpr || 1));
+    const s = Math.round(size * (this._dpr || 1));
     c.width = s;
     c.height = s;
     const g = c.getContext('2d');
-    g.strokeStyle = this.colors.hatch;
+    g.strokeStyle = color;
     g.lineWidth = Math.max(1, (this._dpr || 1) * 1.2);
     g.beginPath();
     g.moveTo(-1, s + 1);
@@ -374,12 +450,12 @@ export class WaveformView extends EventTarget {
     g.moveTo(s - 1, s + 1);
     g.lineTo(s + 1, s - 1);
     g.stroke();
-    this._hatch = ctx.createPattern(c, 'repeat');
-    if (this._hatch && this._hatch.setTransform && typeof DOMMatrix !== 'undefined') {
+    const pat = ctx.createPattern(c, 'repeat');
+    if (pat && pat.setTransform && typeof DOMMatrix !== 'undefined') {
       const k = 1 / (this._dpr || 1);
-      this._hatch.setTransform(new DOMMatrix([k, 0, 0, k, 0, 0]));
+      pat.setTransform(new DOMMatrix([k, 0, 0, k, 0, 0]));
     }
-    return this._hatch;
+    return pat;
   }
 
   // Calcula min/max/rms por columna (ancho `cols`) para el intervalo [t0, t1]
@@ -548,13 +624,14 @@ export class WaveformView extends EventTarget {
         ctx.globalAlpha = 1;
       }
     }
-    // caja de la etiqueta CORTE (a la izquierda de la línea) para no pisarla con números de compás
-    const PILL_W = 50;
+    // caja de la etiqueta CORTE (a la derecha de la línea, sobre lo que se quita) para no pisarla con números de
+    // compás: así se lee el número del último compás que queda
     let pill = null;
     if (cut != null && cut >= start && cut <= end) {
       const xc = Math.round(this._xOf(cut));
-      const px = xc - PILL_W >= 0 ? xc - PILL_W + 1 : Math.min(xc, W - PILL_W);
-      pill = { x0: px - 3, x1: px + PILL_W + 1 };
+      const px = cutPillX(xc, W);
+      // a la derecha la caja empieza en la línea; a la izquierda se deja un margen de 3 px
+      pill = { x0: px >= xc - 1 ? px : px - 3, x1: px + PILL_W + 1 };
     }
     const bars = this.bars;
     if (bars.length) {
@@ -578,18 +655,25 @@ export class WaveformView extends EventTarget {
           ctx.fillStyle = C.downbeat;
           ctx.fillRect(x - 0.5, RULER_H - 6, 1.5, waveBot - RULER_H + 6);
         }
-        if ((b.number - 1) % every === 0 && x >= -2 && x < W - 8) {
+        const counted = this.lastBarIndex < 0 || b.index === undefined || b.index <= this.lastBarIndex;
+        if (counted && (b.number - 1) % every === 0 && x >= -2 && x < W - 8) {
           const label = String(b.number);
           const lw = ctx.measureText(label).width;
-          if (!pill || x + 3 + lw < pill.x0 || x + 3 > pill.x1) {
+          let lx = x + 3;
+          // compás estrecho justo antes de la etiqueta CORTE: el número se arrima a su línea en vez de desaparecer
+          if (pill && lx < pill.x0 && lx + lw >= pill.x0 && pill.x0 - lw - 1 >= x + 1) lx = pill.x0 - lw - 1;
+          if (!pill || lx + lw < pill.x0 || lx > pill.x1) {
             ctx.globalAlpha = removed ? 0.5 : 1;
             ctx.fillStyle = C.barnum;
-            ctx.fillText(label, x + 3, RULER_H / 2);
+            ctx.fillText(label, lx, RULER_H / 2);
           }
         }
       }
       ctx.globalAlpha = 1;
     }
+
+    // cambio de compás: trozos que se quitan / se repiten en cada compás
+    this._drawMeterSlices(ctx, waveTop, waveBot, start, end);
 
     // zona que se quita
     if (cut != null && cut < end) {
@@ -664,9 +748,8 @@ export class WaveformView extends EventTarget {
       ctx.fillStyle = C.cut;
       const lw = this._drag && this._drag.kind === 'cut' ? 3 : 2;
       ctx.fillRect(x - lw / 2, 0, lw, H - TIME_H);
-      // la etiqueta va a la izquierda de la línea para no tapar el número del primer compás que se quita
       const pw = PILL_W;
-      const px = x - pw >= 0 ? x - pw + 1 : Math.min(x, W - pw);
+      const px = cutPillX(x, W);
       roundRect(ctx, px, 1, pw, RULER_H - 2, 6);
       ctx.fill();
       ctx.fillStyle = C.cutText;
@@ -682,6 +765,54 @@ export class WaveformView extends EventTarget {
       ctx.fillStyle = C.cutText;
       ctx.fillRect(x - 3, hy - 5, 1.5, 10);
       ctx.fillRect(x + 1.5, hy - 5, 1.5, 10);
+    }
+  }
+
+  _drawMeterSlices(ctx, top, bot, start, end) {
+    const C = this.colors;
+    const h = bot - top;
+    const rm = this.meterRemoved;
+    if (rm.length) {
+      const [i0, i1] = visibleSlices(rm, start, end);
+      if (i1 > i0) {
+        const hatch = this._redHatchPattern(ctx);
+        // relleno + rayado en una sola pasada por color
+        for (const style of [C.meterRemoved, hatch]) {
+          if (!style) continue;
+          ctx.fillStyle = style;
+          ctx.beginPath();
+          for (let i = i0; i < i1; i++) {
+            const x0 = this._xOf(rm[i].start);
+            const w = Math.max(1, this._xOf(rm[i].end) - x0);
+            ctx.rect(x0, top, w, h);
+          }
+          ctx.fill();
+        }
+      }
+    }
+    const rp = this.meterRepeated;
+    if (rp.length) {
+      const [i0, i1] = visibleSlices(rp, start, end);
+      if (i1 > i0) {
+        ctx.fillStyle = C.meterRepeat;
+        ctx.beginPath();
+        for (let i = i0; i < i1; i++) {
+          const x0 = this._xOf(rp[i].start);
+          ctx.rect(x0, top, Math.max(1, this._xOf(rp[i].end) - x0), h);
+        }
+        ctx.fill();
+        ctx.fillStyle = C.meterRepeatEdge;
+        ctx.font = '800 10px system-ui, -apple-system, "Segoe UI", Roboto, sans-serif';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'top';
+        for (let i = i0; i < i1; i++) {
+          const x0 = this._xOf(rp[i].start);
+          const x1 = this._xOf(rp[i].end);
+          ctx.fillRect(Math.round(x0), top, 1, 3);
+          ctx.fillRect(Math.round(x0), top, Math.max(1, x1 - x0), 2);
+          if (x1 - x0 >= 24) ctx.fillText('×2', (x0 + x1) / 2, top + 4);
+        }
+      }
     }
   }
 
@@ -753,6 +884,14 @@ export class WaveformView extends EventTarget {
       ctx.fillStyle = C.dim;
       ctx.fillRect(cut * k, 0, W - cut * k, H);
     }
+    // cambio de compás: marcas finas en la parte baja de la tira
+    for (const [list, color] of [[this.meterRemoved, C.meterHatch], [this.meterRepeated, C.meterRepeatEdge]]) {
+      if (!list.length) continue;
+      ctx.fillStyle = color;
+      ctx.beginPath();
+      for (const sl of list) ctx.rect(sl.start * k, H - 6, Math.max(1, (sl.end - sl.start) * k), 5);
+      ctx.fill();
+    }
     // ventana visible
     const vx0 = this.view.start * k;
     const vx1 = Math.max(vx0 + 3, this.view.end * k);
@@ -776,6 +915,11 @@ export class WaveformView extends EventTarget {
     return e.clientX - r.left;
   }
 
+  _localY(e, el) {
+    const r = el.getBoundingClientRect();
+    return e.clientY - r.top;
+  }
+
   _bindMain() {
     const cv = this.main;
     cv.addEventListener('pointerdown', (e) => this._onDown(e));
@@ -789,6 +933,30 @@ export class WaveformView extends EventTarget {
     cv.addEventListener('contextmenu', (e) => {
       if (this._drag) e.preventDefault();
     });
+    // Safari de escritorio: el pellizco del trackpad llega como gesturestart/gesturechange (no como ctrl+rueda).
+    // En iOS el pellizco táctil ya llega como dos punteros: ahí solo se evita el zoom de la página.
+    if (typeof window !== 'undefined' && 'GestureEvent' in window) {
+      let lastScale = 1;
+      let anchor;
+      cv.addEventListener('gesturestart', (e) => {
+        e.preventDefault();
+        this._gesture = true;
+        lastScale = 1;
+        anchor = Number.isFinite(e.clientX) ? this._tOf(this._localX(e, cv)) : undefined;
+      });
+      cv.addEventListener('gesturechange', (e) => {
+        e.preventDefault();
+        const sc = Number(e.scale);
+        if (this._pointers.size || !this.duration || !(sc > 0)) return;
+        this._lastInteraction = performance.now();
+        this.zoomBy(lastScale / sc, anchor);
+        lastScale = sc;
+      });
+      cv.addEventListener('gestureend', (e) => {
+        e.preventDefault();
+        this._gesture = false;
+      });
+    }
   }
 
   _nearCut(x, pointerType) {
@@ -814,10 +982,13 @@ export class WaveformView extends EventTarget {
       // puntero ya liberado
     }
     const x = this._localX(e, this.main);
+    const y = this._localY(e, this.main);
     this._pointers.set(e.pointerId, { x });
     if (this._pointers.size === 2) {
       // pellizco: cancela arrastre/paneo y hace zoom + paneo con dos dedos
-      if (this._drag && this._drag.kind === 'cut') this._emitCut(this.cutTime, false, -1, 'end');
+      if (this._drag && this._drag.kind === 'cut' && this._drag.moved) {
+        this._emitCut(this.cutTime, this._lastSnap || false, this._lastSnapIdx ?? -1, 'end');
+      }
       const [a, b] = [...this._pointers.values()];
       const midX = (a.x + b.x) / 2;
       this._drag = {
@@ -830,11 +1001,11 @@ export class WaveformView extends EventTarget {
     }
     if (this._pointers.size > 2) return;
     if (this._nearCut(x, e.pointerType)) {
-      this._drag = { kind: 'cut', id: e.pointerType, offset: x - this._xOf(this.cutTime) };
+      this._drag = { kind: 'cut', id: e.pointerType, offset: x - this._xOf(this.cutTime), x0: x, y0: y, moved: false };
       this._emitCut(this.cutTime, false, -1, 'start');
       this.invalidate();
     } else {
-      this._drag = { kind: 'tap', x0: x, view0: { ...this.view } };
+      this._drag = { kind: 'tap', x0: x, y0: y, view0: { ...this.view } };
     }
   }
 
@@ -859,6 +1030,9 @@ export class WaveformView extends EventTarget {
       return;
     }
     if (d.kind === 'cut') {
+      // un temblor de pocos píxeles no es un arrastre (un toque sobre el marcador no lo mueve)
+      if (!d.moved && Math.abs(x - d.x0) <= 2) return;
+      d.moved = true;
       const raw = clamp(this._tOf(x - d.offset), 0.05, this.duration);
       let t = raw;
       let snapped = false;
@@ -877,9 +1051,17 @@ export class WaveformView extends EventTarget {
       this.invalidate();
       return;
     }
-    if (d.kind === 'tap' && Math.abs(x - d.x0) > 6) {
-      d.kind = 'pan';
-      this.main.style.cursor = 'grabbing';
+    if (d.kind === 'tap') {
+      const g = classifyTapMove(x - d.x0, this._localY(e, this.main) - d.y0);
+      if (g === 'cancel') {
+        // desplazamiento vertical de la página: el gesto no hace nada aquí
+        d.kind = 'void';
+        return;
+      }
+      if (g === 'pan') {
+        d.kind = 'pan';
+        this.main.style.cursor = 'grabbing';
+      }
     }
     if (d.kind === 'pan') {
       const span = d.view0.end - d.view0.start;
@@ -908,7 +1090,13 @@ export class WaveformView extends EventTarget {
     this._drag = null;
     this.main.style.cursor = this._hoverCut ? 'ew-resize' : '';
     if (d.kind === 'cut') {
-      this._emitCut(this.cutTime, this._lastSnap || false, this._lastSnapIdx ?? -1, 'end');
+      if (d.moved) {
+        this._emitCut(this.cutTime, this._lastSnap || false, this._lastSnapIdx ?? -1, 'end');
+      } else if (!cancelled) {
+        // toque quieto sobre el marcador: el corte no cambia; salta ahí como cualquier otro toque
+        const t = clamp(this._tOf(x), 0, this.duration);
+        this.dispatchEvent(new CustomEvent('seek', { detail: { time: t } }));
+      }
       this.invalidate();
     } else if (d.kind === 'tap' && !cancelled) {
       const t = clamp(this._tOf(x), 0, this.duration);
@@ -930,6 +1118,8 @@ export class WaveformView extends EventTarget {
   _onWheel(e) {
     if (!this.duration) return;
     e.preventDefault();
+    // si el navegador manda el pellizco como gesto Y como ctrl+rueda, solo cuenta el gesto
+    if (this._gesture && e.ctrlKey) return;
     this._lastInteraction = performance.now();
     const unit = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? this._h : 1;
     let dx = e.deltaX * unit;
@@ -957,6 +1147,7 @@ export class WaveformView extends EventTarget {
       this._lastInteraction = performance.now();
       this.centerOn(t);
     };
+    // ratón: salta al pulsar; dedo: al soltar o al moverse en horizontal (un gesto vertical desplaza la página)
     cv.addEventListener('pointerdown', (e) => {
       if (!this.duration) return;
       if (e.pointerType === 'mouse' && e.button !== 0) return;
@@ -966,17 +1157,28 @@ export class WaveformView extends EventTarget {
       } catch {
         // sin captura
       }
-      this._ovDrag = e.pointerId;
-      jump(e);
+      const mouse = e.pointerType === 'mouse';
+      this._ovDrag = { id: e.pointerId, x0: this._localX(e, cv), y0: this._localY(e, cv), state: mouse ? 'drag' : 'tap' };
+      if (mouse) jump(e);
     });
     cv.addEventListener('pointermove', (e) => {
-      if (this._ovDrag === e.pointerId) jump(e);
+      const d = this._ovDrag;
+      if (!d || d.id !== e.pointerId) return;
+      if (d.state === 'tap') {
+        const g = classifyTapMove(this._localX(e, cv) - d.x0, this._localY(e, cv) - d.y0);
+        if (g === 'cancel') d.state = 'void';
+        else if (g === 'pan') d.state = 'drag';
+      }
+      if (d.state === 'drag') jump(e);
     });
-    const end = (e) => {
-      if (this._ovDrag === e.pointerId) this._ovDrag = null;
+    const end = (e, cancelled) => {
+      const d = this._ovDrag;
+      if (!d || d.id !== e.pointerId) return;
+      this._ovDrag = null;
+      if (d.state === 'tap' && !cancelled) jump(e);
     };
-    cv.addEventListener('pointerup', end);
-    cv.addEventListener('pointercancel', end);
+    cv.addEventListener('pointerup', (e) => end(e, false));
+    cv.addEventListener('pointercancel', (e) => end(e, true));
   }
 }
 

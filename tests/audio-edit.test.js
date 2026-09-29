@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { fadeGain, renderEdit, FADE_CURVES, ANTICLICK_SEC, CUT_PREROLL_SEC } from '../js/audio/edit.js';
+import { fadeGain, fadeOutGains, renderEdit, FADE_CURVES, ANTICLICK_SEC, CUT_PREROLL_SEC } from '../js/audio/edit.js';
 
 const SR = 44100;
 
@@ -13,7 +13,7 @@ function ramp(n, offset = 0) {
 test('constantes del contrato', () => {
   assert.deepEqual(FADE_CURVES, ['linear', 'smooth', 'exp']);
   assert.equal(ANTICLICK_SEC, 0.005);
-  assert.equal(CUT_PREROLL_SEC, 0.004);
+  assert.equal(CUT_PREROLL_SEC, 0.02);
 });
 
 test('fadeGain: extremos, monotonía y rango para todas las curvas', () => {
@@ -155,4 +155,18 @@ test('renderEdit: cada curva produce un fade monótono sobre señal constante', 
     assert.equal(out[out.length - 1], 0);
     assert.equal(out[f0 - 1], 0.5);
   }
+});
+
+test('fadeOutGains: Float32 de fadeGain((i + 1) / len) y tramos parciales', () => {
+  for (const curve of [...FADE_CURVES, 'nope']) {
+    const g = fadeOutGains(100, curve);
+    assert.ok(g instanceof Float32Array);
+    assert.equal(g.length, 100);
+    for (let i = 0; i < 100; i++) assert.equal(g[i], Math.fround(fadeGain((i + 1) / 100, FADE_CURVES.includes(curve) ? curve : 'smooth')));
+    assert.equal(g[99], 0);
+    assert.deepEqual(fadeOutGains(100, curve, 30, 60), g.subarray(30, 60));
+  }
+  assert.equal(fadeOutGains(10, 'linear', 8, 3).length, 0);
+  assert.equal(fadeOutGains(10, 'linear', -5, 99).length, 10);
+  assert.equal(fadeOutGains(0, 'linear').length, 0);
 });

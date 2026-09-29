@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { renderSegments } from '../js/audio/splice.js';
+import { renderSegments, mixCrossfade, SPLICE_CEILING, renderedLength, segmentSource } from '../js/audio/splice.js';
+import { renderEdit } from '../js/audio/edit.js';
 
 const SR = 44100;
 
@@ -289,7 +290,7 @@ test('rendimiento: 5 min estéreo 44,1 kHz con ~150 empalmes', (t) => {
   const segs = [];
   let cursor = 0;
   for (let bar = 0; bar < 150; bar++) {
-    const barEnd = 0.5 + (bar + 1) * 2 - 0.004;
+    const barEnd = 0.5 + (bar + 1) * 2 - 0.008;
     segs.push({ start: cursor, end: barEnd - 0.25 });
     cursor = barEnd;
   }
@@ -301,4 +302,123 @@ test('rendimiento: 5 min estéreo 44,1 kHz con ~150 empalmes', (t) => {
   t.diagnostic(`renderSegments 5 min estéreo, 150 empalmes: ${ms.toFixed(1)} ms`);
   assert.equal(out[0].length, expectedLength(segs));
   assert.ok(ms < 300, `${ms} ms`);
+});
+
+test('from/to: un tramo de la salida es idéntico al mismo tramo del render completo', () => {
+  const a = noise(SR * 3, 31);
+  const b = sine(3, 440, { amp: 0.6 });
+  const segs = [{ start: 0, end: 0.7 }, { start: 0.95, end: 1.6 }, { start: 1.2, end: 1.6 }, { start: 1.6, end: 2.9 }];
+  for (const opts of [{}, { crossfadeSec: 0.04, fadeOutSec: 0.8, curve: 'exp' }, { crossfadeSec: 0, fadeOutSec: 0.3 }]) {
+    const full = renderSegments([a, b], SR, segs, opts);
+    const total = full[0].length;
+    for (const [from, to] of [[0, Infinity], [0.69, 0.72], [0.5, 1.4], [1.0, 1.9], [2.0, 5], [2.7, undefined], [0.7, 0.7],
+      [-3, 0.2], [0.3456789, 1.2345678]]) {
+      const part = renderSegments([a, b], SR, segs, { ...opts, from, to });
+      const w0 = Math.min(total, Math.max(0, Math.round(from * SR)));
+      const w1 = to === undefined || to === Infinity ? total : Math.min(total, Math.max(w0, Math.round(to * SR)));
+      for (let c = 0; c < 2; c++) {
+        assert.equal(part[c].length, w1 - w0, `${from}–${to}`);
+        assert.deepEqual(part[c], full[c].subarray(w0, w1), `${from}–${to} canal ${c}`);
+      }
+    }
+  }
+});
+
+test('modo 1 por renderSegments = renderEdit, muestra a muestra (un solo fadeGain para los dos)', () => {
+  const L = noise(SR * 3, 41);
+  const R = sine(3, 220, { amp: 0.5 });
+  for (const curve of ['linear', 'smooth', 'exp', 'otra']) {
+    for (const [cutTime, fadeSec] of [[2.5, 0], [2.5, 0.001], [2.3456, 1.5], [0.02, 1]]) {
+      const a = renderSegments([L, R], SR, [{ start: 0, end: cutTime }], { fadeOutSec: fadeSec, curve });
+      const b = renderEdit([L, R], SR, { cutTime, fadeSec, curve });
+      assert.deepEqual(a, b, `${curve} ${cutTime} ${fadeSec}`);
+      // vista previa de los últimos 0,8 s (from) = renderEdit con startTime
+      const start = Math.max(0, cutTime - 0.8);
+      const pa = renderSegments([L, R], SR, [{ start: 0, end: cutTime }], { fadeOutSec: fadeSec, curve, from: start });
+      const pb = renderEdit([L, R], SR, { cutTime, fadeSec, curve, startTime: start });
+      assert.deepEqual(pa, pb, `preview ${curve} ${cutTime} ${fadeSec}`);
+    }
+  }
+});
+
+test('crossfade sobre audio correlacionado y a tope (master): nunca supera el pico de la fuente', () => {
+  // Riff periódico (período 441 muestras) + algo de ruido, limitado duro a ±0,97 como un master "a tope".
+  // Los empalmes saltan un número entero de períodos: A y B casi idénticos (ρ ≈ 1), donde el crossfade de
+  // igual potencia llegaba a +3 dB (y recortaba al exportar).
+  const n = SR * 4;
+  const nz = noise(n, 77);
+  const src = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    const ph = (2 * Math.PI * i) / 441;
+    const v = 1.3 * (Math.sin(ph) + 0.4 * Math.sin(3 * ph + 0.7)) + 0.08 * nz[i];
+    src[i] = Math.max(-0.97, Math.min(0.97, v));
+  }
+  const segs = [];
+  for (let k = 0; k < 12; k++) segs.push({ start: 0.1 + k * 0.3, end: 0.1 + k * 0.3 + 0.25 });   // saltos de 0,05 s
+  for (const xfSec of [0.005, 0.01, 0.04]) {
+    const out = renderSegments([src], SR, segs, { crossfadeSec: xfSec })[0];
+    assert.ok(maxAbs(out) <= 0.97 + 1e-6, `${xfSec}: pico ${maxAbs(out)}`);
+  }
+});
+
+test('mixCrossfade: igual potencia sin correlación, igual ganancia en fase; cerca de 0 dBFS nunca sobre el pico', () => {
+  const L = 441;
+  const c = new Float64Array(L);
+  const s = new Float64Array(L);
+  for (let j = 0; j < L; j++) {
+    c[j] = Math.cos(((j + 0.5) / L) * Math.PI / 2);
+    s[j] = Math.sin(((j + 0.5) / L) * Math.PI / 2);
+  }
+  const y = new Float64Array(L);
+  const rms = (x, a, b) => { let e = 0; for (let i = a; i < b; i++) e += x[i] * x[i]; return Math.sqrt(e / (b - a)); };
+  // ruido independiente a nivel normal: la potencia en el centro se mantiene, como con igual potencia
+  let lvl = 0;
+  const trials = 40;
+  for (let t = 0; t < trials; t++) {
+    const a = Float64Array.from(noise(L, 100 + t), (v) => v * 0.4);
+    const b = Float64Array.from(noise(L, 500 + t), (v) => v * 0.4);
+    mixCrossfade(a, b, L, c, s, y);
+    lvl += 20 * Math.log10(rms(y, 110, 331) / rms(a, 110, 331));
+  }
+  assert.ok(Math.abs(lvl / trials) < 0.5, `nivel medio ${lvl / trials} dB`);
+  // ruido a 0 dBFS: nunca por encima del pico de A y B (no se crea recorte)
+  for (let t = 0; t < trials; t++) {
+    const a = Float64Array.from(noise(L, 900 + t));
+    const b = Float64Array.from(noise(L, 1300 + t));
+    mixCrossfade(a, b, L, c, s, y);
+    const peak = Math.max(maxAbs(Float32Array.from(a)), maxAbs(Float32Array.from(b)));
+    for (let j = 0; j < L; j++) assert.ok(Math.abs(y[j]) <= Math.max(peak, SPLICE_CEILING) * (1 + 1e-6));
+  }
+  // misma señal en A y B: la salida es la señal (sin +3 dB)
+  const a = Float64Array.from(sine(0.01, 300, { amp: 0.8 }).subarray(0, L));
+  mixCrossfade(a, a, L, c, s, y);
+  for (let j = 0; j < L; j++) assert.ok(Math.abs(y[j] - a[j]) < 1e-9);
+  // al revés de fase: sin división por cero ni valores raros
+  const neg = a.map((v) => -v);
+  mixCrossfade(a, neg, L, c, s, y);
+  for (let j = 0; j < L; j++) assert.ok(Number.isFinite(y[j]) && Math.abs(y[j]) <= 0.8 + 1e-6);
+  // silencio en los dos
+  const z = new Float64Array(L);
+  mixCrossfade(z, z, L, c, s, y);
+  for (let j = 0; j < L; j++) assert.equal(y[j], 0);
+});
+
+test('segmentSource: leer la salida por tramos da las mismas muestras que el render completo', () => {
+  const a = noise(SR * 3, 61);
+  const b = sine(3, 440, { amp: 0.6 });
+  const segs = [{ start: 0, end: 0.7 }, { start: 0.95, end: 1.6 }, { start: 1.2, end: 1.6 }, { start: 1.6, end: 2.9 }];
+  const opts = { crossfadeSec: 0.03, fadeOutSec: 0.8, curve: 'exp' };
+  const full = renderSegments([a, b], SR, segs, opts);
+  const src = segmentSource([a, b], SR, segs, opts);
+  assert.equal(src.length, full[0].length);
+  assert.equal(src.length, renderedLength(segs, SR));
+  assert.equal(src.numberOfChannels, 2);
+  for (const step of [1000, 4410, 44100]) {
+    for (let s0 = 0; s0 < src.length; s0 += step) {
+      const s1 = Math.min(src.length, s0 + step);
+      const part = src.read(s0, s1);
+      for (let c = 0; c < 2; c++) assert.deepEqual(part[c], full[c].subarray(s0, s1), `${step} @${s0}`);
+    }
+  }
+  assert.equal(renderedLength([{ start: 1, end: 0.5 }, null, { start: NaN, end: 1 }], SR), 0);
 });

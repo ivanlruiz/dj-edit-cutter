@@ -3,6 +3,12 @@
 // analyze() hace el análisis completo y devuelve un AnalysisResult (objeto JSON plano, ver SPEC).
 // AnalysisSession guarda las características para rehacer sólo los beats (retrack: botones ×2 / ÷2) o sólo los
 // compases (relabel: compás elegido, "mover el 1") sin volver a calcular el espectro. El worker usa la sesión.
+//
+// Campos añadidos al AnalysisResult del SPEC (opcionales para quien los lea):
+//   tailBeatsFrom: number  índice del primer beat EXTRAPOLADO por la cola de un acorde final que resuena (beats sin
+//                          onset propio, puestos al tempo final mientras el sonido sigue: la UI puede atenuarlos), o −1
+//                          si no hay. Los beats [tailBeatsFrom, beats.length) no cuentan para detectar el compás: su
+//                          posición continúa la cuenta del último compás (o se reinicia en un "1" forzado).
 import { computeFeatures } from './features.js';
 import { estimateTempo } from './tempo.js';
 import { findMusicBounds, findLastOnset } from './bounds.js';
@@ -19,6 +25,8 @@ const DC_CUTOFF_HZ = 10; // paso alto de 1 polo contra offset DC (las caracterí
 const FORCED_CONFIDENCE = 0.75; // compases con un "1" fijado a mano: el usuario ya los ha revisado
 const REMAP_MAX_SEC = 0.1; // retrack: un "1" forzado sigue al beat nuevo más cercano si está a menos de esto
 const REMAP_MAX_IBI = 0.25; // … y a menos de 1/4 del intervalo entre beats nuevo
+const PROGRESS_MIN_MS = 50; // fracciones intermedias de una etapa: como mucho una cada 50 ms (0 y 1 siempre)
+const MIN_LABELLED_BEATS = 4; // con menos beats "reales" que esto, la cola también se etiqueta con el HMM
 
 const now = () => (globalThis.performance && performance.now ? performance.now() : Date.now());
 const round = (x, d) => {
@@ -161,7 +169,17 @@ function resample(x, from, to) {
 
 function progressReporter(onProgress) {
   if (typeof onProgress !== 'function') return () => {};
+  let lastT = -Infinity;
+  let lastKey = '';
   return (stage, fraction) => {
+    // 0 y 1 siempre; las fracciones intermedias, limitadas en el tiempo y siempre crecientes dentro de la etapa
+    const edge = fraction === 0 || fraction === 1;
+    const t = now();
+    if (!edge) {
+      if (t - lastT < PROGRESS_MIN_MS || `${stage}:${fraction}` === lastKey) return;
+    }
+    lastT = t;
+    lastKey = `${stage}:${fraction}`;
     try {
       onProgress(stage, fraction);
     } catch {
@@ -190,6 +208,19 @@ function tempoSummary(beats) {
   return { bpm: round(median(inst), 1), bpmRange: [round(quantile(s, 0.1), 1), round(quantile(s, 0.9), 1)] };
 }
 
+/**
+ * Completa `positions` (in place) hasta n beats continuando la cuenta del compás: p + 1, y 0 tras el último tiempo
+ * (o tras el tiempo extra de un compás largo). Un "1" forzado reinicia la cuenta.
+ */
+export function extendPositions(positions, n, beatsPerBar, forced = []) {
+  const f = new Set(forced);
+  for (let i = positions.length; i < n; i++) {
+    const prev = i > 0 ? positions[i - 1] : beatsPerBar - 1;
+    positions.push(f.has(i) || prev + 1 >= beatsPerBar ? 0 : prev + 1);
+  }
+  return positions;
+}
+
 export class AnalysisSession {
   /**
    * @param {Float32Array} samples mono (normalmente 22050 Hz; otras frecuencias se remuestrean)
@@ -210,7 +241,7 @@ export class AnalysisSession {
     this.bounds = null;
     this.tempo = null;
     this.lastOnset = 0;
-    this.track = null; // { beats (afinados), strength, confidence }
+    this.track = null; // { beats (afinados), strength, confidence, tailFrom }
     this.beatsPerBar = this.options.beatsPerBar;
     this.forced = [];
     this.bars = null;
@@ -229,7 +260,9 @@ export class AnalysisSession {
     }
     this.beatsPerBar = this.options.beatsPerBar;
     this.forced = [];
-    this.features = computeFeatures(this.samples, this.sampleRate);
+    // la etapa 'features' es ≈ 70 % del tiempo: su avance interno va de 0.05 a 0.95
+    report('features', 0.05);
+    this.features = computeFeatures(this.samples, this.sampleRate, { onProgress: (f) => report('features', 0.05 + 0.9 * f) });
     this.bounds = findMusicBounds(this.samples, this.sampleRate);
     this.lastOnset = findLastOnset(this.features, this.bounds.musicEnd);
     timings.features = now() - t;
@@ -324,21 +357,52 @@ export class AnalysisSession {
       return Number.isFinite(v) ? Math.min(1, Math.max(0, v)) : 0;
     });
     const conf = Number(tr.confidence);
-    this.track = { beats, strength, confidence: beats.length >= 2 && Number.isFinite(conf) ? Math.min(1, Math.max(0, conf)) : 0 };
+    const tail = Math.max(0, Math.min(beats.length, Math.floor(Number(tr.extrapolated) || 0)));
+    this.track = {
+      beats,
+      strength,
+      confidence: beats.length >= 2 && Number.isFinite(conf) ? Math.min(1, Math.max(0, conf)) : 0,
+      tailFrom: tail > 0 ? beats.length - tail : -1,
+    };
   }
 
   _label() {
     const beats = this.track.beats;
     this.forced = sanitizeForced(this.forced, beats.length);
-    const lb = labelBars(this.features, beats, { beatsPerBar: this.beatsPerBar, forcedDownbeats: this.forced });
+    // la cola extrapolada no tiene onsets propios: no cuenta para el compás (se etiqueta continuando la cuenta)
+    const tailFrom = this.track.tailFrom;
+    let nLab = tailFrom >= MIN_LABELLED_BEATS ? tailFrom : beats.length;
+    const label = (forcedDownbeats) => labelBars(this.features, nLab < beats.length ? beats.slice(0, nLab) : beats, {
+      beatsPerBar: this.beatsPerBar,
+      forcedDownbeats,
+    });
+    let lb = label(this.forced.filter((i) => i < nLab));
+    // un "1" forzado dentro de la cola (▶ desde el golpe final, "este beat es el 1" en la resonancia) no se descarta:
+    // se lleva compases enteros hacia atrás hasta la parte etiquetada (el compás elegido no depende de los forzados),
+    // así toda la rejilla se desplaza igual que si estuviera allí
+    const inTail = this.forced.filter((i) => i >= nLab);
+    if (inTail.length) {
+      const M = lb.beatsPerBar;
+      const proj = inTail.map((f) => f - Math.ceil((f - nLab + 1) / M) * M);
+      if (proj.every((p) => p >= 0)) {
+        lb = label(sanitizeForced([...this.forced.filter((i) => i < nLab), ...proj], nLab));
+      } else {
+        nLab = beats.length; // casi nada etiquetado: se etiqueta todo con el HMM
+        lb = label(this.forced);
+      }
+    }
+    const positions = Array.from(lb.positions || []);
+    extendPositions(positions, beats.length, lb.beatsPerBar, this.forced);
+    const downbeats = [];
+    for (let i = 0; i < positions.length; i++) if (positions[i] === 0) downbeats.push(i);
     let conf = Number(lb.confidence);
     conf = beats.length >= 2 && Number.isFinite(conf) ? Math.min(1, Math.max(0, conf)) : 0;
     if (this.forced.length && beats.length >= 2) conf = Math.max(conf, FORCED_CONFIDENCE);
     this.bars = {
       beatsPerBar: lb.beatsPerBar,
       meterAuto: !!lb.meterAuto,
-      positions: Array.from(lb.positions || []),
-      downbeats: Array.from(lb.downbeats || []),
+      positions,
+      downbeats,
       confidence: conf,
     };
   }
@@ -366,6 +430,7 @@ export class AnalysisSession {
       forcedDownbeats: this.forced.slice(),
       confidence: { beats: round(this.track.confidence, 3), bars: round(this.bars.confidence, 3) },
       timingsMs,
+      tailBeatsFrom: this.track.tailFrom,
     };
   }
 }

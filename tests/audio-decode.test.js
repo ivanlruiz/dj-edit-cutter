@@ -1,6 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { sniffSampleRate, resample, downmixMono, toAnalysisMono, createResampler } from '../js/audio/decode.js';
+import {
+  sniffSampleRate, resample, downmixMono, toAnalysisMono, createResampler, analysisMixWeights, ANALYSIS_RESAMPLER, yieldTask,
+} from '../js/audio/decode.js';
 
 // ---------- fabricación de cabeceras ----------
 
@@ -259,4 +261,53 @@ test('downmixMono promedia y toAnalysisMono devuelve un array nuevo a 22050 Hz',
   const o2 = await toAnalysisMono(same);
   assert.equal(o2.length, 100);
   assert.notEqual(o2.buffer, chans[0].buffer);
+});
+
+const fakeBuffer = (chans, sampleRate) => ({
+  numberOfChannels: chans.length, sampleRate, length: chans[0].length, duration: chans[0].length / sampleRate,
+  getChannelData: (c) => chans[c],
+});
+
+function noiseArr(n, seed) {
+  const a = new Float32Array(n);
+  let s = seed >>> 0 || 1;
+  for (let i = 0; i < n; i++) {
+    s ^= s << 13; s >>>= 0; s ^= s >>> 17; s ^= s << 5; s >>>= 0;
+    a[i] = ((s / 0xffffffff) * 2 - 1) * 0.6;
+  }
+  return a;
+}
+
+test('toAnalysisMono por bloques = mezcla entera + remuestreo (mismas muestras), sin la copia mono a 48 kHz', async () => {
+  for (const [sr, n] of [[48000, 48000 * 3 + 17], [44100, 150001], [96000, 70000]]) {
+    const L = noiseArr(n, 3);
+    const R = tone(n, 330, sr, 0.4);
+    const ref = resample(downmixMono([L, R]), sr, 22050, ANALYSIS_RESAMPLER);
+    const got = await toAnalysisMono(fakeBuffer([L, R], sr), 22050);
+    assert.equal(got.length, ref.length);
+    assert.deepEqual(got, ref, `${sr} Hz`);
+  }
+});
+
+test('toAnalysisMono: estéreo en contrafase (R = −L) no se anula; casi en contrafase sigue siendo el promedio', async () => {
+  const n = 22050 * 2;
+  const L = tone(n, 440, 22050, 0.5);
+  const inv = L.map((v) => -v);
+  assert.deepEqual(analysisMixWeights([L, inv]), [0.5, -0.5]);
+  const m = await toAnalysisMono(fakeBuffer([L, inv], 22050), 22050);
+  for (let i = 0; i < n; i += 997) assert.ok(Math.abs(m[i] - L[i]) < 1e-6);
+  const r48 = await toAnalysisMono(fakeBuffer([tone(96000, 440, 48000, 0.5), tone(96000, 440, 48000, 0.5).map((v) => -v)], 48000));
+  assert.ok(Math.abs(amplitude(r48, 440, 22050) - 0.5) < 0.005);
+  // R = −0.9·L: el promedio conserva señal (−20 dB), no se toca
+  assert.deepEqual(analysisMixWeights([L, L.map((v) => -0.9 * v)]), [0.5, 0.5]);
+  // más de 2 canales que se anulan: el canal más fuerte
+  assert.deepEqual(analysisMixWeights([L, inv.map((v) => v * 1.0), new Float32Array(n)]).map((w) => Math.abs(w)), [1, 0, 0]);
+  // silencio: promedio normal
+  assert.deepEqual(analysisMixWeights([new Float32Array(10), new Float32Array(10)]), [0.5, 0.5]);
+});
+
+test('yieldTask cede el hilo y resuelve en orden', async () => {
+  const order = [];
+  await Promise.all([yieldTask().then(() => order.push(1)), yieldTask().then(() => order.push(2))]);
+  assert.deepEqual(order, [1, 2]);
 });

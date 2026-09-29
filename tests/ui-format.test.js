@@ -3,8 +3,8 @@ import assert from 'node:assert/strict';
 import {
   formatTime, formatDuration, formatBpm, formatBars, formatBeats, formatSeconds, formatFade, formatNumber,
   meterText, nearestIndex, lowerBound, medianBeatInterval, fadeBeatsToSeconds, confidenceInfo, cutReadout,
-  nextBarsCount, initialViewRange, shiftedDownbeatIndex, exportOptions, overallProgress, shortcutAction,
-  errorMessage, looksLikeAudio, formatFileSize, FADE_BEAT_STEPS, BAR_CHIPS,
+  nextBarsCount, initialViewRange, startViewRange, shiftedDownbeatIndex, exportOptions, overallProgress, shortcutAction,
+  errorMessage, looksLikeAudio, formatFileSize, FADE_BEAT_STEPS, BAR_CHIPS, endConsistency,
 } from '../js/ui/format.js';
 
 test('formatTime: m:ss.cc con redondeo y horas', () => {
@@ -27,20 +27,20 @@ test('formatDuration trunca a segundos', () => {
 test('formatBpm muestra rango solo si hay deriva', () => {
   assert.equal(formatBpm(124, [118.2, 127.9]), '≈ 124 BPM (118–128)');
   assert.equal(formatBpm(124, [123.6, 124.4]), '≈ 124 BPM');
-  assert.equal(formatBpm(123.5), '≈ 123.5 BPM');
+  assert.equal(formatBpm(123.5), '≈ 123,5 BPM');
   assert.equal(formatBpm(0), 'Tempo desconocido');
 });
 
 test('compases y beats con singular/plural', () => {
   assert.equal(formatBars(1), '1 compás');
   assert.equal(formatBars(4), '4 compases');
-  assert.equal(formatBars(2.46), '2.5 compases');
-  assert.equal(formatBars(0.5), '0.5 compases');
+  assert.equal(formatBars(2.46), '2,5 compases');
+  assert.equal(formatBars(0.5), '0,5 compases');
   assert.equal(formatBeats(0.5), '½ beat');
   assert.equal(formatBeats(1), '1 beat');
   assert.equal(formatBeats(8), '8 beats');
   assert.equal(formatNumber(2.0), '2');
-  assert.equal(formatNumber(2.25, 2), '2.25');
+  assert.equal(formatNumber(2.25, 2), '2,25');   // coma decimal, como en el nombre del archivo
   assert.equal(meterText(3), '3/4');
 });
 
@@ -49,14 +49,14 @@ test('fade: segundos a partir de la mediana de los beats previos al corte', () =
   const beats = [];
   for (let i = 0; i < 20; i++) beats.push(i * 0.5);
   beats.push(10.2, 11.0, 12.0);
-  const cut = 9.5 - 0.004; // justo antes del beat 19
+  const cut = 9.5 - 0.008; // justo antes del beat 19 (pre-roll)
   assert.ok(Math.abs(medianBeatInterval(beats, cut) - 0.5) < 1e-9);
   assert.ok(Math.abs(fadeBeatsToSeconds(2, beats, cut, 120) - 1.0) < 1e-9);
   assert.equal(fadeBeatsToSeconds(0, beats, cut, 120), 0);
   assert.equal(medianBeatInterval([], 3, 8, 100), 0.6);
   assert.equal(formatFade(0, 0), 'Corte seco (sin fade)');
-  assert.equal(formatFade(2, 0.968), '2 beats ≈ 0.97 s');
-  assert.equal(formatSeconds(12.34), '12.3 s');
+  assert.equal(formatFade(2, 0.968), '2 beats ≈ 0,97 s');
+  assert.equal(formatSeconds(12.34), '12,3 s');
   assert.deepEqual(FADE_BEAT_STEPS, [0, 0.5, 1, 2, 4, 8, 16]);
   assert.deepEqual(BAR_CHIPS, [1, 2, 4, 8, 16, 32]);
 });
@@ -83,6 +83,8 @@ test('confianza', () => {
 
 test('cutReadout', () => {
   assert.equal(cutReadout(221.246, 232.5), 'Corte en 3:41.25 · la canción pasa de 3:52 a 3:41');
+  assert.equal(cutReadout(221.246, 232.5, 198.7), 'Corte en 3:41.25 · con el compás nuevo pasa de 3:52 a 3:18');
+  assert.equal(cutReadout(221.246, 232.5, undefined), 'Corte en 3:41.25 · la canción pasa de 3:52 a 3:41');
 });
 
 test('nextBarsCount desde compases y desde ajuste manual', () => {
@@ -111,6 +113,30 @@ test('initialViewRange muestra los últimos compases y el corte', () => {
   assert.ok(z.start > 65 && z.start < 71 && z.end <= 102);
 });
 
+test('startViewRange: el principio de la canción con los primeros compases (recortar cada compás)', () => {
+  const bars = [];
+  for (let i = 0; i < 40; i++) bars.push({ index: i, number: i + 1, start: 1 + i * 2, end: 3 + i * 2 });
+  // anacrusa corta: desde 0 hasta el final del compás 12 (+ un margen pequeño)
+  const v = startViewRange({ bars, duration: 85, barsCount: 12 });
+  assert.equal(v.start, 0);
+  assert.ok(v.end >= bars[11].end && v.end < bars[12].start + 0.5, `end ${v.end}`);
+  const m = startViewRange({ bars, duration: 85, barsCount: 8 });
+  assert.ok(m.end >= bars[7].end && m.end < bars[8].start + 0.5, `end ${m.end}`);
+  // intro larga antes del primer "1": desde un compás antes
+  const late = bars.map((b) => ({ ...b, start: b.start + 20, end: b.end + 20 }));
+  const w = startViewRange({ bars: late, duration: 105, barsCount: 12 });
+  assert.equal(w.start, late[0].start - 2);
+  assert.ok(w.end >= late[11].end);
+  // canción con menos compases de los pedidos: hasta el último, sin pasarse de la duración
+  const few = startViewRange({ bars: bars.slice(0, 3), duration: 7.05, barsCount: 12 });
+  assert.equal(few.start, 0);
+  assert.ok(few.end >= 7 && few.end <= 7.05);
+  // sin compases: los primeros 30 s; sin duración: vacío
+  assert.deepEqual(startViewRange({ bars: [], duration: 100 }), { start: 0, end: 30 });
+  assert.deepEqual(startViewRange({ bars: [], duration: 12 }), { start: 0, end: 12 });
+  assert.deepEqual(startViewRange({ bars, duration: 0 }), { start: 0, end: 0 });
+});
+
 test('shiftedDownbeatIndex mueve el 1 más cercano', () => {
   const beats = Array.from({ length: 16 }, (_, i) => i * 0.5);
   const result = { beats, downbeats: [0, 4, 8, 12] };
@@ -131,12 +157,17 @@ test('exportOptions y progreso', () => {
 
 test('shortcutAction ignora campos de texto y modificadores', () => {
   assert.equal(shortcutAction({ key: ' ', targetTag: 'BODY' }), 'toggle-play');
-  assert.equal(shortcutAction({ key: ' ', targetTag: 'BUTTON' }), 'toggle-play');
+  assert.equal(shortcutAction({ key: ' ', targetTag: 'BUTTON' }), null);   // Espacio activa el botón con foco
+  assert.equal(shortcutAction({ key: ' ', targetTag: 'INPUT', targetType: 'button' }), null);
+  assert.equal(shortcutAction({ key: ' ', targetTag: 'CANVAS' }), 'toggle-play');
   assert.equal(shortcutAction({ key: 'ArrowLeft', shiftKey: true, targetTag: 'DIV' }), 'cut-bar-prev');
   assert.equal(shortcutAction({ key: 'ArrowRight', targetTag: 'DIV' }), 'cut-beat-next');
   assert.equal(shortcutAction({ key: 'ArrowRight', targetTag: 'INPUT', targetType: 'range' }), null);
   assert.equal(shortcutAction({ key: 'm', targetTag: 'SELECT' }), null);
   assert.equal(shortcutAction({ key: 'p', targetTag: 'BODY', ctrlKey: true }), null);
+  assert.equal(shortcutAction({ key: 't', targetTag: 'BODY' }), 'tap-tempo');
+  assert.equal(shortcutAction({ key: 'T', targetTag: 'BUTTON' }), 'tap-tempo');
+  assert.equal(shortcutAction({ key: 't', targetTag: 'INPUT', targetType: 'text' }), null);
   assert.equal(shortcutAction({ key: '+', targetTag: 'BODY' }), 'zoom-in');
   assert.equal(shortcutAction({ key: '-', targetTag: 'BODY' }), 'zoom-out');
   assert.equal(shortcutAction({ key: 'M', targetTag: 'BODY' }), 'metronome');
@@ -154,4 +185,29 @@ test('mensajes y utilidades varias', () => {
   assert.equal(looksLikeAudio('foto.jpg', 'image/jpeg'), false);
   assert.equal(looksLikeAudio('x', 'audio/flac'), true);
   assert.equal(formatFileSize(5 * 1024 * 1024), '5 MB');
+});
+
+test('endConsistency / confidenceInfo: golpe final fuera del «1» (ni en el último tiempo ni anticipado) → «Revisa la cuadrícula»', () => {
+  // 4/4 a 120 BPM: beats cada 0,5 s, "1" en 0, 4, 8…
+  const beats = Array.from({ length: 40 }, (_, i) => i * 0.5);
+  const positions = beats.map((_, i) => i % 4);
+  const base = { beats, positions, beatsPerBar: 4, downbeats: beats.map((_, i) => i).filter((i) => i % 4 === 0) };
+  const high = { beats: 0.9, bars: 0.9 };
+  const at = (lastOnset) => ({ ...base, lastOnset });
+  assert.equal(endConsistency(at(16)).ok, true);          // en el "1" (beat 32)
+  assert.equal(endConsistency(at(16.03)).ok, true);
+  assert.equal(endConsistency(at(15.5)).ok, true);        // último tiempo (final seco en el 4)
+  assert.equal(endConsistency(at(15.75)).ok, true);       // anticipado ("y" del 4)
+  assert.equal(endConsistency(at(15)).ok, false);         // tercer tiempo
+  assert.equal(endConsistency(at(14.5)).ok, false);       // segundo tiempo
+  assert.equal(endConsistency(at(16.25)).ok, false);      // a contratiempo después del "1"… (más cerca del 1: 0,25 s tarde)
+  assert.equal(endConsistency({ beats: [0, 1], positions: [0, 1], beatsPerBar: 4, lastOnset: 1 }).ok, null);
+  assert.equal(endConsistency(null).ok, null);
+  assert.equal(confidenceInfo(high).level, 'high');
+  assert.equal(confidenceInfo(high, at(16)).level, 'high');
+  const bad = confidenceInfo(high, at(15));
+  assert.equal(bad.level, 'low');
+  assert.equal(bad.low, true);
+  assert.equal(bad.end, true);
+  assert.equal(confidenceInfo({ beats: 0.3, bars: 0.9 }, at(16)).level, 'low');
 });

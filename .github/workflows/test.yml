@@ -1,0 +1,52 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit:
+    name: Tests unitarios (Node 22)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # sin dependencias: no hace falta npm install
+      - run: npm test
+
+  browser:
+    name: Tests de navegador (Chromium)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      LANG: C.UTF-8
+      E2E_SCREENSHOTS: ${{ github.workspace }}/e2e-screens
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # Playwright no está en package.json (la app no tiene dependencias): se instala solo para esta tarea.
+      # Misma versión con la que se validaron los tests en local.
+      - name: Instalar Playwright y Chromium
+        run: |
+          npm install --no-save --no-package-lock playwright@1.56.1
+          npx playwright install --with-deps chromium
+      - run: npm run e2e:all
+      - name: Guardar capturas si falla
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-screens
+          path: e2e-screens
+          if-no-files-found: ignore

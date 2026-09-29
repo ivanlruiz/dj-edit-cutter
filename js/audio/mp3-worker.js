@@ -13,7 +13,7 @@
 /* global lamejs */
 'use strict';
 
-importScripts('../../vendor/lame.min.js');
+importScripts('../../vendor/lame.min.js' + ((self.location && self.location.search) || ''));
 
 var SAMPLES_PER_FRAME = 1152;
 var BLOCK_FRAMES = 32;

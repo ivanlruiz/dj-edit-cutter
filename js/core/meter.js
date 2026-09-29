@@ -1,6 +1,9 @@
 // Cambio de compás (modo 2): se quita o se repite el FINAL de cada compás y se empalma,
 // sin estirar el tiempo. Lógica pura (sin DOM): todo en segundos sobre la línea de tiempo original.
 
+import { getBars, findLastBarIndex } from './bars.js';
+import { CUT_PREROLL_SEC } from '../audio/edit.js';
+
 export const METER_PRESETS = Object.freeze([
   Object.freeze({ num: 7, den: 8 }),
   Object.freeze({ num: 3, den: 4 }),
@@ -9,8 +12,7 @@ export const METER_PRESETS = Object.freeze([
 
 const VALID_DENS = [2, 4, 8, 16];
 const MAX_NUM = 32;
-const SNAP_MAX_SEC = 0.025;       // el imán solo puede mover un límite menos de 25 ms
-const LAST_BAR_TOLERANCE = 0.08;  // mismo criterio que core/bars.js (findLastBarIndex)
+export const SNAP_MAX_SEC = 0.025;   // el imán solo puede mover un límite menos de 25 ms
 const EPS = 1e-6;
 
 const MSG_TOO_SHORT = 'Ese compás es demasiado corto para esta canción.';
@@ -22,6 +24,8 @@ const MSG_BAD_SOURCE = 'No se conoce el compás original de la canción.';
 const MSG_NO_BEATS = 'No hay beats detectados en la canción.';
 const MSG_NO_BARS = 'No se detectaron compases en la canción.';
 const MSG_NOTHING = 'No hay compases completos que cambiar.';
+// Textos que la interfaz necesita reconocer
+export const METER_MESSAGES = Object.freeze({ noBeats: MSG_NO_BEATS, noBars: MSG_NO_BARS, nothing: MSG_NOTHING });
 
 // Figura cuya duración es 1/n de redonda.
 const NOTE_NAMES = { 1: 'redonda', 2: 'blanca', 4: 'negra', 8: 'corchea', 16: 'semicorchea', 32: 'fusa' };
@@ -89,20 +93,6 @@ function finiteOr(...vals) {
   return 0;
 }
 
-// Índices de los "1": downbeats si vienen, si no se derivan de positions. Ascendentes y válidos.
-function barStartIndices(result, nBeats) {
-  let src = isList(result.downbeats) && result.downbeats.length ? Array.from(result.downbeats) : null;
-  if (!src && isList(result.positions)) {
-    src = [];
-    for (let i = 0; i < result.positions.length && i < nBeats; i++) if (result.positions[i] === 0) src.push(i);
-  }
-  const out = [];
-  for (const i of src || []) {
-    if (Number.isInteger(i) && i >= 0 && i < nBeats && (!out.length || i > out[out.length - 1])) out.push(i);
-  }
-  return out;
-}
-
 // Tiempo del límite de unidad u (0..S) dentro del compás que empieza en el beat b0:
 // interpolación lineal dentro del beat; el final del último beat es el siguiente "1".
 function unitTime(beats, b0, u, k) {
@@ -127,7 +117,7 @@ function noopPlan(end, delta, unitsPerBeat, error, info) {
 }
 
 export function planMeterChange(result, options = {}) {
-  const { targetNum, targetDen, sourceDen = 4, limitTime = null, preroll = 0.004, snap = null } = options || {};
+  const { targetNum, targetDen, sourceDen = 4, limitTime = null, preroll = CUT_PREROLL_SEC, snap = null } = options || {};
   const r = result || {};
   const beats = isList(r.beats) ? r.beats : [];
   const nBeats = beats.length;
@@ -142,21 +132,14 @@ export function planMeterChange(result, options = {}) {
   if (desc.error) return noopPlan(end, delta, k, desc.error, null);
   if (delta === 0) return noopPlan(end, delta, k, null, MSG_SAME);
 
-  const db = barStartIndices(r, nBeats);
-  if (!db.length) return noopPlan(end, delta, k, MSG_NO_BARS, null);
+  // Mismo modelo de compases que el modo 1 (core/bars.js)
+  const bars = getBars(r);
+  if (!bars.length) return noopPlan(end, delta, k, MSG_NO_BARS, null);
 
-  // Límite de transformación: el corte del modo 1, o el inicio del último compás
-  // (el que contiene el golpe final, como findLastBarIndex; si no hay lastOnset, el último "1").
-  let limit = end;
-  if (!hasLimit) {
-    let last = db.length - 1;
-    if (Number.isFinite(r.lastOnset)) {
-      let found = -1;
-      for (let j = 0; j < db.length; j++) if (beats[db[j]] <= r.lastOnset + LAST_BAR_TOLERANCE) found = j;
-      if (found >= 0) last = found;
-    }
-    limit = Math.min(end, beats[db[last]]);
-  }
+  // Límite de transformación: el inicio del compás del golpe final (findLastBarIndex) o, si es antes, el corte del
+  // modo 1. El compás final y su cola nunca se tocan, aunque el corte del modo 1 esté dentro de la cola.
+  const last = findLastBarIndex(r);
+  const limit = Math.min(end, bars[last >= 0 ? last : 0].start);
 
   const T = desc.targetUnits;
   const segments = [];
@@ -170,9 +153,9 @@ export function planMeterChange(result, options = {}) {
     if (b - a > 1e-9) segments.push({ start: a, end: b });
   };
 
-  for (let j = 0; j + 1 < db.length; j++) {
-    const b0 = db[j];
-    const b1 = db[j + 1];
+  for (let j = 0; j + 1 < bars.length; j++) {
+    const b0 = bars[j].beatIndex;
+    const b1 = bars[j + 1].beatIndex;
     const barStart = beats[b0];
     const barEnd = beats[b1];
     if (!(barEnd > barStart)) continue;

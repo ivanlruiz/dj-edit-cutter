@@ -6,7 +6,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   exportAudio, suggestFileName, mp3SampleRateFor, downmixToStereo, planSegments, buildLameInfoFrame, crc16,
-  buildTagBytes, MP3_ENCODER_DELAY,
+  buildTagBytes, MP3_ENCODER_DELAY, workerCount, channelSource, MAX_WORKERS, MAX_WORKERS_LOW_MEMORY,
 } from '../js/audio/export.js';
 import { parseWav } from '../js/audio/wav.js';
 import { readId3v2, buildId3v2, frameText } from '../js/audio/id3.js';
@@ -132,6 +132,19 @@ test('suggestFileName: casos límite', () => {
   assert.ok(long.length < 150);
   assert.ok(suggestFileName('Cafe\u0301.mp3', { barsRemoved: 1, format: 'mp3' }).startsWith('Café'));   // NFC
   assert.ok(!/[\u0000-\u001f]/.test(suggestFileName('a\u0001b\nc.mp3', { barsRemoved: 1, format: 'mp3' })));
+});
+
+test('suggestFileName: con el compás nuevo', () => {
+  assert.equal(suggestFileName('Canción.mp3', { barsRemoved: 2, format: 'mp3', meter: { num: 7, den: 8 } }), 'Canción (7-8, edit -2 compases).mp3');
+  assert.equal(suggestFileName('Canción.mp3', { barsRemoved: null, format: 'wav', meter: { num: 7, den: 8 } }), 'Canción (7-8).wav');
+  assert.equal(suggestFileName('Canción.flac', { format: 'wav', meter: '15/16' }), 'Canción (15-16).wav');
+  assert.equal(suggestFileName('tema.mp3', { barsRemoved: 1, format: 'mp3', meter: '5/4' }), 'tema (5-4, edit -1 compás).mp3');
+  assert.equal(suggestFileName('tema.mp3', { barsRemoved: 0, format: 'mp3', meter: { num: 3, den: 4 } }), 'tema (3-4, edit).mp3');
+  assert.equal(suggestFileName('tema.mp3', { barsRemoved: 2.5, format: 'mp3', meter: { num: 3, den: 4 } }), 'tema (3-4, edit -2,5 compases).mp3');
+  // compás inválido → como sin compás
+  assert.equal(suggestFileName('tema.mp3', { barsRemoved: 2, format: 'mp3', meter: { num: NaN, den: 8 } }), 'tema (edit -2 compases).mp3');
+  assert.equal(suggestFileName('tema.mp3', { format: 'mp3', meter: 'x' }), 'tema (edit).mp3');
+  assert.equal(suggestFileName('tema.mp3', { barsRemoved: 4, format: 'mp3', meter: null }), 'tema (edit -4 compases).mp3');
 });
 
 test('mp3SampleRateFor: sólo frecuencias MPEG-1', () => {
@@ -319,4 +332,31 @@ test('exportAudio WAV: 16 y 24 bits con chunk id3 filtrado', async () => {
   assert.equal(parseWav(await plain.arrayBuffer()).id3, null);
   assert.equal(buildTagBytes(new ArrayBuffer(100)), null);
   assert.equal(buildTagBytes(null), null);
+});
+
+test('workerCount: como mucho 3 workers MP3 (2 en móviles / poca memoria)', () => {
+  assert.equal(MAX_WORKERS, 3);
+  assert.equal(MAX_WORKERS_LOW_MEMORY, 2);
+  assert.equal(workerCount(0, { hardwareConcurrency: 16, lowMemory: false }), 3);
+  assert.equal(workerCount(0, { hardwareConcurrency: 8, lowMemory: true }), 2);
+  assert.equal(workerCount(0, { hardwareConcurrency: 2, lowMemory: false }), 1);
+  assert.equal(workerCount(1, { hardwareConcurrency: 16, lowMemory: false }), 1);
+});
+
+test('exportAudio desde una fuente por tramos: mismos bytes que desde los canales y nunca lee la salida entera', async () => {
+  const sr = 44100;
+  const chans = music(30, sr);
+  const tags = buildTagBytes(sourceWithTag());
+  for (const [format, extra] of [['wav', { bitDepth: 16 }], ['wav', { bitDepth: 24 }], ['mp3', { kbps: 256 }]]) {
+    const reads = [];
+    const base = channelSource(chans);
+    const source = { ...base, read: (a, b) => { reads.push(b - a); return base.read(a, b); } };
+    const a = await exportAudio({ source, sampleRate: sr, format, ...extra, tagBytes: tags });
+    const b = await exportAudio({ channels: chans, sampleRate: sr, format, ...extra, sourceBytes: sourceWithTag() });
+    assert.deepEqual(new Uint8Array(await a.arrayBuffer()), new Uint8Array(await b.arrayBuffer()), format);
+    assert.ok(reads.length >= 2 && Math.max(...reads) < chans[0].length, `${format}: tramos ${reads.join(', ')}`);
+  }
+  // tagBytes null = sin etiquetas aunque keepTags
+  const none = await exportAudio({ channels: chans, sampleRate: sr, format: 'wav', tagBytes: null });
+  assert.equal(parseWav(await none.arrayBuffer()).id3, null);
 });

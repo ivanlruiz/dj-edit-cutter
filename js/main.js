@@ -1,25 +1,38 @@
 // Controlador de la app: estados (vacío → cargando → analizando → listo / error) y cableado de la UI.
+// Dos operaciones independientes y combinables: recortar cada compás (modo 2, la principal: activa por defecto, quita
+// la última corchea de cada compás → 4/4 pasa a 7/8) y quitar compases del final (modo 1, apagada por defecto).
+// Exportación y vistas previas usan el mismo plan de segmentos (ui/edit-plan.js) y el mismo render (audio/splice.js).
 
 import { AnalysisClient } from './analysis/client.js';
 import {
   getBars, findLastBarIndex, cutForBarsRemoved, barsRemovedAt, nearestBeatIndex, stepBeat, stepBar,
 } from './core/bars.js';
-import { decodeAudioFile, toAnalysisMono } from './audio/decode.js';
-import { renderEdit, fadeGain, CUT_PREROLL_SEC } from './audio/edit.js';
-import { exportAudio, suggestFileName } from './audio/export.js';
-import { readId3v2 } from './audio/id3.js';
+import { describeMeterChange, METER_MESSAGES } from './core/meter.js';
+import { decodeAudioFile, toAnalysisMono, yieldTask } from './audio/decode.js';
+import { fadeGain, CUT_PREROLL_SEC } from './audio/edit.js';
+import { renderSegments, renderedLength, segmentSource } from './audio/splice.js';
+import { exportAudio, suggestFileName, buildTagBytes } from './audio/export.js';
 import { Player } from './audio/player.js';
 import { WaveformView } from './ui/waveform.js';
 import {
   FADE_BEAT_STEPS, BAR_CHIPS, STAGE_LABELS, clamp, overallProgress, formatTime, formatDuration, formatBpm,
   formatBars, formatNumber, formatFade, meterText, confidenceInfo, cutReadout, nextBarsCount, initialViewRange,
-  shiftedDownbeatIndex, fadeBeatsToSeconds, exportOptions, formatFileSize, shortcutAction, errorMessage, looksLikeAudio,
+  startViewRange, shiftedDownbeatIndex, fadeBeatsToSeconds, exportOptions, formatFileSize, shortcutAction, errorMessage, looksLikeAudio,
 } from './ui/format.js';
+import {
+  XFADE_MS, METER_AMOUNTS, DEFAULT_METER_AMOUNT, METER_DENS, MANUAL_BPM, buildEditPlan, exportBlocker, meterApplies,
+  previewStartTime, outputToSourceFn, mapBeatsToOutput, makeTransientSnap, tapTempo, parseBpm, parseIntStrict,
+  durationChange, barsChangedText, meterChangeLabel, targetMeter, meterLabel, meterAmountChips, readyMessage,
+} from './ui/edit-plan.js';
 
 const ANALYSIS_RATE = 22050;
 const PREVIEW_SEC = 8;
 const FADE_CURVES_UI = ['linear', 'smooth', 'exp'];
 const PREFS_KEY = 'djEditCutter.prefs.v1';
+const TOAST_MS = 2600;
+const TOAST_READY_MS = 6000;   // el aviso «Listo» explica lo que se va a hacer: más tiempo para leerlo
+const TOAST_ERROR_MS = 8000;
+const TEMPO_MATCH = [0.92, 1.08]; // tempo resultante / pedido que cuenta como "el pedido"
 
 const $ = (id) => document.getElementById(id);
 const el = {
@@ -30,23 +43,32 @@ const el = {
   errorBox: $('error-box'), errorText: $('error-text'),
   editor: $('editor'), wave: $('wave'),
   zoomIn: $('btn-zoom-in'), zoomOut: $('btn-zoom-out'), zoomAll: $('btn-zoom-all'), zoomCut: $('btn-zoom-cut'),
+  waveLegend: $('wave-legend'), waveLegendSwatch: $('wave-legend-swatch'), waveLegendText: $('wave-legend-text'),
+  wavePreview: $('btn-wave-preview'), wavePreviewLabel: $('wave-preview-label'),
   play: $('btn-play'), playLabel: $('play-label'), timeNow: $('time-now'), timeTotal: $('time-total'),
   metro: $('btn-metro'),
   infoBpm: $('info-bpm'), infoMeter: $('info-meter'), infoBars: $('info-bars'), infoConf: $('info-conf'),
   lowConf: $('low-conf-hint'), noGrid: $('no-grid-hint'),
   tempoDouble: $('btn-tempo-double'), tempoHalf: $('btn-tempo-half'), selMeter: $('sel-meter'),
+  bpmInput: $('inp-bpm'), bpmApply: $('btn-bpm-apply'), tap: $('btn-tap'), tapValue: $('tap-value'),
   onePrev: $('btn-one-prev'), oneNext: $('btn-one-next'), thisOne: $('btn-this-one'), resetGrid: $('btn-reset-grid'),
   reviewBusy: $('review-busy'), reviewPanel: $('panel-review'),
+  panelCut: $('panel-cut'), mode1: $('chk-mode1'), mode1Body: $('mode1-body'), mode1Off: $('mode1-off'),
   barsMinus: $('btn-bars-minus'), barsPlus: $('btn-bars-plus'), barsValue: $('bars-value'), chips: $('bar-chips'),
   manualNote: $('manual-note'), readout: $('cut-readout'),
   beatPrev: $('btn-beat-prev'), beatNext: $('btn-beat-next'), barPrev: $('btn-bar-prev'), barNext: $('btn-bar-next'),
   msPrev: $('btn-ms-prev'), msNext: $('btn-ms-next'), snap: $('chk-snap'),
   fade: $('rng-fade'), fadeValue: $('fade-value'), curve: $('sel-curve'), preview: $('btn-preview'),
-  previewLabel: $('preview-label'),
-  formats: $('formats'), keepTags: $('chk-tags'), tagsNote: $('tags-note'), outName: $('out-name'),
-  exportBtn: $('btn-export'), exportLabel: $('export-label'), exportProgress: $('export-progress'),
-  exportFill: $('export-fill'),
-  status: $('status'), toast: $('toast'),
+  previewLabel: $('preview-label'), previewHelp: $('preview-help'),
+  panelMeter: $('panel-meter'), mode2: $('chk-mode2'), mode2Body: $('mode2-body'), mode2Off: $('mode2-off'),
+  meterChips: $('meter-chips'), meterOther: $('meter-other'), meterNum: $('inp-meter-num'), meterDen: $('sel-meter-den'),
+  meterSummary: $('meter-summary'), meterChange: $('meter-change'), meterDesc: $('meter-desc'), meterStats: $('meter-stats'), meterMsg: $('meter-msg'),
+  xfade: $('rng-xfade'), xfadeValue: $('xfade-value'), meterPreview: $('btn-meter-preview'),
+  meterPreviewLabel: $('meter-preview-label'),
+  resultSummary: $('result-summary'), formats: $('formats'), keepTags: $('chk-tags'), tagsNote: $('tags-note'),
+  outName: $('out-name'), outNameLine: $('out-name-line'), exportBtn: $('btn-export'), exportLabel: $('export-label'), exportProgress: $('export-progress'),
+  exportFill: $('export-fill'), exportHint: $('export-hint'),
+  status: $('status'), toast: $('toast'), toastText: $('toast-text'), toastClose: $('toast-close'),
 };
 
 // ---------- preferencias (solo comodidad local) ----------
@@ -61,11 +83,23 @@ function loadPrefs() {
 
 const prefs = loadPrefs();
 
+// Cuánto se recorta de cada compás (se recuerda entre visitas; por defecto ½ tiempo = la última corchea)
+function initialMeter() {
+  const ids = METER_AMOUNTS.map((c) => c.id);
+  const amount = ids.includes(prefs.meterAmount) ? prefs.meterAmount : DEFAULT_METER_AMOUNT;
+  const num = Number.isInteger(prefs.meterNum) && prefs.meterNum >= 1 && prefs.meterNum <= 32 ? prefs.meterNum : 7;
+  const den = METER_DENS.includes(prefs.meterDen) ? prefs.meterDen : 8;
+  return { amount, num: String(num), den: String(den) };
+}
+
 const state = {
   phase: 'empty',
   gen: 0,
-  song: null, // { name, size, buffer, bytes, sampleRate, duration, hasTags }
+  loadReq: 0, // última carga pedida (una carga más nueva descarta las anteriores)
+  pending: null, // { name, size } del archivo que se está leyendo (la canción anterior sigue hasta que decodifique)
+  song: null, // { name, size, buffer, tagBytes, sampleRate, duration, hasTags }
   result: null,
+  resultVersion: 0,
   bars: [],
   lastBarIndex: -1,
   downbeatSet: new Set(),
@@ -77,18 +111,32 @@ const state = {
   keepTags: prefs.keepTags !== false,
   format: exportOptions(prefs.format).id,
   metronome: false,
-  meterChoice: 'auto',
+  meterChoice: 'auto', // tiempos por compás del análisis
   forced: [],
   tempoChanged: false,
   busy: false,
   exporting: false,
   downloadUrl: null,
+  exportError: '', // último error al exportar (se muestra junto al botón hasta el siguiente intento o cambio)
+  // modos: «Recortar cada compás» (modo 2) es lo principal y viene activado; «Quitar compases del final» (modo 1), no
+  mode1: false,
+  mode2: true,
+  newMeter: initialMeter(), // { amount: 'eighth'|'beat'|'two-beats'|'sixteenth'|'extend'|'other', num, den } (num/den: "Otro")
+  xfadeMs: clamp(Number.isFinite(prefs.xfadeMs) ? Math.round(prefs.xfadeMs) : XFADE_MS.def, XFADE_MS.min, XFADE_MS.max),
+  snapFn: null, // imán de los límites internos del modo 2 (por canción)
+  taps: [],
 };
 
 function savePrefs() {
+  const num = parseIntStrict(state.newMeter.num);
+  const den = parseIntStrict(state.newMeter.den);
   try {
     localStorage.setItem(PREFS_KEY, JSON.stringify({
       fadeIdx: state.fadeIdx, curve: state.curve, snap: state.snap, keepTags: state.keepTags, format: state.format,
+      meterAmount: state.newMeter.amount,
+      meterNum: Number.isInteger(num) && num >= 1 && num <= 32 ? num : undefined,
+      meterDen: METER_DENS.includes(den) ? den : undefined,
+      xfadeMs: state.xfadeMs,
     }));
   } catch {
     // almacenamiento no disponible
@@ -102,20 +150,57 @@ const wave = new WaveformView(el.wave);
 // ---------- utilidades ----------
 
 let toastTimer = 0;
-function announce(message, kind = 'info', { visual = true } = {}) {
+function hideToast() {
+  clearTimeout(toastTimer);
+  el.toast.hidden = true;
+}
+
+// Aviso visual: abajo en el centro, salvo que tape los controles principales (entonces arriba)
+function placeToast() {
+  const t = el.toast;
+  const avoid = [el.play, el.wave, el.metro, el.preview, el.meterPreview, el.exportBtn, el.barsValue,
+    el.mode1.parentElement, el.mode2.parentElement, el.zoomAll.parentElement, el.waveLegend, el.wavePreview,
+    el.panelMeter.querySelector('.panel-head'), el.meterChips];
+  const overlap = () => {
+    const r = t.getBoundingClientRect();
+    let area = 0;
+    for (const e of avoid) {
+      if (!e || !e.getClientRects().length) continue;
+      const q = e.getBoundingClientRect();
+      const w = Math.min(r.right, q.right) - Math.max(r.left, q.left);
+      const h = Math.min(r.bottom, q.bottom) - Math.max(r.top, q.top);
+      if (w > 0 && h > 0) area += w * h;
+    }
+    return area;
+  };
+  t.dataset.pos = 'bottom';
+  const bottom = overlap();
+  if (!bottom) return;
+  t.dataset.pos = 'top';
+  if (overlap() > bottom) t.dataset.pos = 'bottom';
+}
+
+function announce(message, kind = 'info', { visual = true, ms = 0 } = {}) {
   el.status.textContent = '';
   // cambio en dos pasos para que el lector de pantalla repita mensajes iguales
   requestAnimationFrame(() => {
     el.status.textContent = message;
   });
   if (!visual) return;
-  el.toast.textContent = message;
+  el.toastText.textContent = message;
   el.toast.dataset.kind = kind;
   el.toast.hidden = false;
+  placeToast();
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => {
-    el.toast.hidden = true;
-  }, kind === 'error' ? 9000 : 4000);
+  toastTimer = setTimeout(hideToast, ms || (kind === 'error' ? TOAST_ERROR_MS : TOAST_MS));
+}
+
+function coarsePointer() {
+  try {
+    return !!(window.matchMedia && window.matchMedia('(pointer: coarse)').matches);
+  } catch {
+    return false;
+  }
 }
 
 function channelsOf(buffer) {
@@ -124,8 +209,21 @@ function channelsOf(buffer) {
   return out;
 }
 
+// Deja pintar la interfaz antes de un trabajo largo. En una pestaña oculta no hay requestAnimationFrame (y los
+// temporizadores van a ~1 s): ahí se cede el hilo con un mensaje, para que la carga o la exportación no se paren.
 function nextFrame() {
-  return new Promise((r) => requestAnimationFrame(() => setTimeout(r, 0)));
+  if (document.hidden) return yieldTask();
+  return new Promise((r) => {
+    let done = false;
+    const go = () => {
+      if (done) return;
+      done = true;
+      document.removeEventListener('visibilitychange', go);
+      r();
+    };
+    requestAnimationFrame(() => setTimeout(go, 0));
+    document.addEventListener('visibilitychange', go);   // si la pestaña se oculta mientras espera
+  });
 }
 
 function safe(fn, fallback) {
@@ -136,16 +234,6 @@ function safe(fn, fallback) {
   }
 }
 
-function detectTags(bytes) {
-  if (!bytes) return false;
-  try {
-    const r = readId3v2(bytes);
-    return !!(r && r.frames && r.frames.length);
-  } catch {
-    return false;
-  }
-}
-
 function medianBarLength() {
   const b = state.bars;
   if (b.length > 1) return (b[b.length - 1].start - b[0].start) / (b.length - 1);
@@ -153,12 +241,27 @@ function medianBarLength() {
   return bpm > 0 ? (240 / bpm) : 2;
 }
 
+// Imán del modo 2 con memoria: los límites internos solo dependen de los beats y del audio
+function cachedSnap(buffer) {
+  const raw = safe(() => makeTransientSnap(channelsOf(buffer), buffer.sampleRate), null);
+  if (!raw) return null;
+  const memo = new Map();
+  return (t) => {
+    let v = memo.get(t);
+    if (v === undefined) {
+      v = raw(t);
+      memo.set(t, v);
+    }
+    return v;
+  };
+}
+
 // ---------- fases ----------
 
 function setPhase(phase) {
   state.phase = phase;
   document.body.dataset.phase = phase;
-  const hasSong = !!(state.song && state.song.name);
+  const hasSong = !!((state.pending || state.song) && (state.pending || state.song).name);
   el.dropzone.hidden = phase === 'loading' || phase === 'analyzing' || phase === 'ready';
   // el input oculto solo recibe foco cuando se ve la zona de carga
   el.fileInput.tabIndex = el.dropzone.hidden ? -1 : 0;
@@ -170,14 +273,14 @@ function setPhase(phase) {
 }
 
 function renderSongBar() {
-  const s = state.song;
+  const s = state.pending || state.song;
   if (!s) return;
   el.songName.textContent = s.name;
   const parts = [];
   if (Number.isFinite(s.duration)) parts.push(formatDuration(s.duration));
   if (s.sampleRate) parts.push(`${formatNumber(s.sampleRate / 1000, 1)} kHz`);
   if (s.size) parts.push(formatFileSize(s.size));
-  if (state.phase === 'loading' || state.phase === 'analyzing') parts.push('analizando…');
+  if (state.phase === 'loading' || state.phase === 'analyzing') parts.push(state.phase === 'loading' ? 'leyendo…' : 'analizando…');
   el.songSub.textContent = parts.join(' · ');
 }
 
@@ -221,6 +324,7 @@ function resetSong() {
   }
   state.song = null;
   state.result = null;
+  state.resultVersion++;
   state.bars = [];
   state.lastBarIndex = -1;
   state.downbeatSet = new Set();
@@ -230,53 +334,92 @@ function resetSong() {
   state.forced = [];
   state.tempoChanged = false;
   state.busy = false;
+  state.snapFn = null;
+  state.taps = [];
   el.selMeter.value = 'auto';
+  el.bpmInput.value = '';
+  el.tapValue.textContent = 'Toca al ritmo';
   el.reviewPanel.removeAttribute('aria-busy');
   el.reviewBusy.hidden = true;
   revokeDownload();
 }
 
-async function loadFile(file) {
-  if (!file) return;
-  const gen = ++state.gen;
-  resetSong();
-  if (file.type && !looksLikeAudio(file.name, file.type)) {
-    state.song = { name: file.name, size: file.size };
-    fail('no-audio');
+// ¿Hay una canción lista (analizada) que conservar si el archivo nuevo no sirve?
+function hasReadySong() {
+  return !!(state.song && state.song.buffer && state.result);
+}
+
+// El archivo elegido no se puede usar: si había una canción lista, se queda (y el editor vuelve); si no, pantalla
+// de error.
+function rejectFile(kind, file, err) {
+  state.pending = null;
+  const msg = errorMessage(kind, err);
+  if (hasReadySong()) {
+    setPhase('ready');
+    renderSongBar();
+    announce(`«${file.name}»: ${msg} Sigue cargada «${state.song.name}».`, 'error');
     return;
   }
   state.song = { name: file.name, size: file.size };
-  if (!file.size) {
-    fail('empty');
+  fail(kind, err);
+}
+
+async function loadFile(file) {
+  if (!file) return;
+  // Validación sin decodificar: un archivo que no es audio no toca lo que ya está cargado (ni una carga en curso)
+  const bad = file.type && !looksLikeAudio(file.name, file.type) ? 'no-audio' : !file.size ? 'empty' : null;
+  if (bad) {
+    if (state.phase === 'loading' || state.phase === 'analyzing') announce(errorMessage(bad), 'error');
+    else rejectFile(bad, file);
     return;
   }
+  const req = ++state.loadReq;
+  // La canción lista se conserva hasta que la nueva se decodifique; sin canción lista, se descarta ya
+  const keep = hasReadySong();
+  let gen;
+  if (!keep) {
+    gen = ++state.gen;
+    resetSong();
+  } else {
+    player.stop();
+  }
+  state.pending = { name: file.name, size: file.size };
   setPhase('loading');
   renderSongBar();
   setProgress('read', 0.05);
-  announce(`Cargando «${file.name}»…`);
+  announce(`Cargando «${file.name}»…`, 'info', { visual: false });
 
   let decoded;
   try {
     decoded = await decodeAudioFile(file);
   } catch (err) {
-    if (gen === state.gen) fail('decode', err);
+    if (req === state.loadReq) rejectFile('decode', file, err);
     return;
   }
-  if (gen !== state.gen) return;
+  if (req !== state.loadReq) return;
   if (!decoded || !decoded.buffer || !decoded.buffer.length) {
-    fail('empty');
+    rejectFile('empty', file);
     return;
   }
+  if (keep) {
+    gen = ++state.gen;
+    resetSong();
+  }
+  state.pending = null;
   const { buffer } = decoded;
+  // de los bytes del archivo solo hacen falta las etiquetas: el resto no se guarda en memoria
+  const tagBytes = safe(() => buildTagBytes(decoded.bytes), null);
+  decoded = null;
   state.song = {
-    name: decoded.name || file.name,
+    name: file.name,
     size: file.size,
     buffer,
-    bytes: decoded.bytes,
-    sampleRate: decoded.sampleRate || buffer.sampleRate,
+    tagBytes,
+    sampleRate: buffer.sampleRate,
     duration: buffer.duration,
-    hasTags: detectTags(decoded.bytes),
+    hasTags: !!tagBytes,
   };
+  state.snapFn = cachedSnap(buffer);
   renderSongBar();
   setProgress('read', 0.55);
   player.setBuffer(buffer);
@@ -314,12 +457,49 @@ async function loadFile(file) {
   renderSongBar();
   renderAllControls();
   setInitialView();
+  announce(readyText(), 'info', { ms: TOAST_READY_MS });
+}
+
+// "Listo: ≈ 120 BPM · 4/4 → 7/8 · se quita la última corchea de cada compás" (+ el corte del final si está activo)
+function readyText() {
+  const r = state.result;
   const c = state.cut;
-  announce(`Listo: ${formatBpm(result.bpm)} · ${meterText(result.beatsPerBar)} · ` +
-    (c.mode === 'bars' ? `se quita ${formatBars(c.n)}` : 'coloca el corte a mano'));
+  const hasBeats = !!(r.beats && r.beats.length > 1);
+  const plan = currentPlan();
+  const applies = state.mode2 && meterApplies(plan);
+  let meter = null;
+  if (applies) {
+    const tm = currentTarget();
+    meter = { num: tm.num, den: tm.den, text: describeMeterChange(r.beatsPerBar, tm.num, tm.den).text };
+  }
+  const extra = [];
+  if (state.mode2 && hasBeats && !applies) extra.push('no se puede recortar cada compás');
+  if (state.mode1 && c) {
+    extra.push(c.mode !== 'bars' ? 'coloca el corte a mano' : `${c.n === 1 ? 'se quita' : 'se quitan'} ${formatBars(c.n)} del final`);
+  }
+  return readyMessage({ bpm: r.bpm, beatsPerBar: r.beatsPerBar, hasBeats, meter, extra });
+}
+
+// Compás nuevo elegido para la canción actual → { amount, num, den }
+function currentTarget() {
+  const r = state.result;
+  return targetMeter(state.newMeter, r ? r.beatsPerBar : 4);
 }
 
 function setInitialView() {
+  const narrow = window.innerWidth < 640;
+  // solo recortando cada compás: el principio de la canción, con los trozos que se quitan bien visibles
+  if (state.mode2 && !state.mode1 && state.bars.length > 1) {
+    const v = startViewRange({ bars: state.bars, duration: state.song.duration, barsCount: narrow ? 8 : 12 });
+    wave.setView(v.start, v.end);
+    wave.setPlayhead(player.currentTime);
+    return;
+  }
+  showEndView();
+}
+
+// El final de la canción con el corte a la vista (vista de «Quitar compases del final»)
+function showEndView() {
   const r = state.result;
   const narrow = window.innerWidth < 640;
   const v = initialViewRange({
@@ -327,7 +507,7 @@ function setInitialView() {
     lastBarIndex: state.lastBarIndex,
     musicEnd: r ? r.musicEnd : undefined,
     duration: state.song.duration,
-    cutTime: state.cut ? state.cut.time : undefined,
+    cutTime: state.mode1 && state.cut ? state.cut.time : undefined,
     barsBack: narrow ? 12 : 16,
   });
   wave.setView(v.start, v.end);
@@ -337,12 +517,15 @@ function setInitialView() {
 // ---------- resultado del análisis ----------
 
 function applyResult(result, { initial = false } = {}) {
+  // la cuadrícula nueva cambia el plan: lo que suena ya no vale
+  if (!initial) stopPreviewPlayback();
   state.result = result;
+  state.resultVersion++;
   state.bars = safe(() => getBars(result), []) || [];
   state.lastBarIndex = safe(() => findLastBarIndex(result), -1);
   state.downbeatSet = new Set(result.downbeats || []);
   state.barByBeat = new Map(state.bars.map((b) => [b.beatIndex, b.index]));
-  wave.setGrid({ beats: result.beats || [], bars: state.bars });
+  wave.setGrid({ beats: result.beats || [], bars: state.bars, lastBarIndex: state.lastBarIndex });
   player.setMetronome({ enabled: state.metronome, beats: result.beats || [], downbeatSet: state.downbeatSet });
   if (initial || !state.cut || state.cut.mode === 'bars') {
     const n = initial || !state.cut ? 1 : state.cut.n;
@@ -363,6 +546,45 @@ function defaultManualCut() {
 
 function maxBars() {
   return Math.max(0, state.lastBarIndex);
+}
+
+// ---------- plan de edición (los dos modos) ----------
+
+let planMemo = { key: '', plan: null };
+
+function currentPlan() {
+  if (!state.result || !state.song || !state.song.buffer) return null;
+  const tm = currentTarget();
+  const useCut = state.mode1 && !!state.cut;
+  const fadeSec = useCut ? currentFadeSec() : 0;
+  const key = [
+    state.resultVersion, useCut ? state.cut.time : '-', fadeSec, state.mode2 ? `${tm.num}/${tm.den}` : '-', state.xfadeMs,
+  ].join('|');
+  if (planMemo.key === key) return planMemo.plan;
+  const plan = buildEditPlan(state.result, {
+    duration: state.song.duration,
+    mode1: useCut,
+    cutTime: useCut ? state.cut.time : null,
+    fadeSec,
+    mode2: state.mode2,
+    targetNum: tm.num,
+    targetDen: tm.den,
+    crossfadeSec: state.xfadeMs / 1000,
+    snap: state.snapFn,
+  });
+  planMemo = { key, plan };
+  return plan;
+}
+
+// Algo que cambia el resultado: se para la vista previa y se redibuja todo lo que depende del plan
+function onPlanChanged({ stopPreview = true } = {}) {
+  if (stopPreview) stopPreviewPlayback();
+  state.exportError = '';
+  const plan = currentPlan();
+  wave.setMeterEdit(state.mode2 && plan && plan.meter && !plan.meter.error ? plan.meter : null);
+  renderMeter();
+  renderCut();
+  renderSave();
 }
 
 // ---------- corte ----------
@@ -404,11 +626,10 @@ function setCutAtBeat(i) {
 
 function onCutChanged() {
   if (!state.cut) return;
-  if (player.playing && player.mode === 'preview') player.stop();
-  wave.setCut(state.cut.time);
+  wave.setCut(state.mode1 ? state.cut.time : null);
   renderFade();
-  renderCut();
-  renderOutName();
+  // el corte solo afecta al resultado con el modo 1 activo
+  onPlanChanged({ stopPreview: state.mode1 });
 }
 
 function refTime() {
@@ -460,6 +681,53 @@ function showCutAndEnd() {
   wave.setView(Math.min(v.start, cut - bar * 2), end + bar * 0.5);
 }
 
+// ---------- modos ----------
+
+function renderMode1Switch() {
+  el.mode1.checked = state.mode1;
+  el.panelCut.dataset.on = String(state.mode1);
+  el.mode1Body.hidden = !state.mode1;
+  el.mode1Off.hidden = state.mode1;
+  // «Ir al corte» solo tiene sentido con el corte del final
+  el.zoomCut.hidden = !state.mode1;
+  wave.setCut(state.mode1 && state.cut ? state.cut.time : null);
+}
+
+function setMode1(on) {
+  state.mode1 = !!on;
+  renderMode1Switch();
+  renderFade();
+  renderInfo();
+  onPlanChanged();
+  // al activarlo, que se vea el marcador del corte (la vista inicial puede estar en el principio)
+  if (state.mode1 && state.cut) {
+    const v = wave.getView();
+    if (state.cut.time < v.start || state.cut.time > v.end) showEndView();
+  }
+}
+
+function setMode2(on) {
+  state.mode2 = !!on;
+  el.mode2.checked = state.mode2;
+  onPlanChanged();
+}
+
+function chooseMeter(amount) {
+  if (!METER_AMOUNTS.some((c) => c.id === amount)) return;
+  if (amount === 'other' && state.newMeter.amount !== 'other') {
+    // "Otro compás" arranca con el compás que se estaba usando
+    const cur = currentTarget();
+    if (Number.isInteger(cur.num)) state.newMeter.num = String(cur.num);
+    if (Number.isInteger(cur.den)) state.newMeter.den = String(cur.den);
+    el.meterNum.value = state.newMeter.num;
+    el.meterDen.value = state.newMeter.den;
+  }
+  state.newMeter.amount = amount;
+  savePrefs();
+  onPlanChanged();
+  if (amount === 'other' && !coarsePointer()) el.meterNum.focus();
+}
+
 // ---------- fade ----------
 
 function fadeBeats() {
@@ -478,7 +746,7 @@ function renderFade() {
   el.fadeValue.textContent = text;
   el.fade.setAttribute('aria-valuetext', text);
   const curve = state.curve;
-  wave.setFade(sec, (x) => fadeGain(x, curve));
+  wave.setFade(state.mode1 ? sec : 0, (x) => fadeGain(x, curve));
 }
 
 // ---------- render de paneles ----------
@@ -486,9 +754,10 @@ function renderFade() {
 function renderInfo() {
   const r = state.result;
   if (!r) return;
+  const hasBeats = !!(r.beats && r.beats.length > 1);
   el.infoBpm.textContent = formatBpm(r.bpm, r.bpmRange);
-  el.infoMeter.textContent = meterText(r.beatsPerBar);
-  if (r.meterAuto) {
+  el.infoMeter.textContent = hasBeats ? meterText(r.beatsPerBar) : '–';
+  if (r.meterAuto && hasBeats) {
     const sub = document.createElement('span');
     sub.className = 'info-sub';
     sub.textContent = ' auto';
@@ -496,12 +765,26 @@ function renderInfo() {
   }
   const count = state.lastBarIndex >= 0 ? state.lastBarIndex + 1 : state.bars.length;
   el.infoBars.textContent = count ? String(count) : '—';
-  const ci = confidenceInfo(r.confidence);
-  el.infoConf.textContent = ci.label;
-  el.infoConf.dataset.level = ci.level;
   const noGrid = !state.bars.length || state.lastBarIndex < 1;
   el.noGrid.hidden = !noGrid;
-  el.lowConf.hidden = !ci.low || noGrid;
+  const oneBar = state.bars.length && state.lastBarIndex === 0;
+  // con «Quitar compases del final» el corte se puede poner a mano; si no, lo que no se puede hacer es recortar
+  el.noGrid.textContent = state.mode1
+    ? (oneBar ? 'Solo se encontró un compás: no hay compases que quitar. ' : 'No se encontraron compases en este audio. ') +
+      'Arrastra el marcador naranja para colocar el corte a mano.'
+    : (oneBar ? 'Solo se encontró un compás, así que no hay compases que recortar. '
+      : 'No se encontraron compases en este audio, así que no se puede recortar cada compás. ') +
+      'Si la canción tiene ritmo, prueba «Tempo manual» o «Marcar tempo»; para cortar el final a mano, activa «Quitar compases del final».';
+  // con un "1" fijado a mano el usuario ya revisó la cuadrícula: insignia neutra y sin el aviso
+  const manual = !!(r.forcedDownbeats && r.forcedDownbeats.length);
+  const ci = confidenceInfo(r.confidence, r);
+  el.infoConf.textContent = manual ? 'Cuadrícula ajustada a mano' : ci.label;
+  el.infoConf.dataset.level = manual ? 'manual' : ci.level;
+  el.lowConf.hidden = manual || !ci.low || noGrid;
+  el.lowConf.textContent = (ci.end
+    ? `El golpe final no cae en un «1» de la cuadrícula, así que ${state.mode1 ? 'el corte puede no estar donde crees' : 'los compases pueden estar desplazados'}. `
+    : 'La detección no es segura. ') +
+    'Activa el clic de metrónomo y escucha: si el acento no cae en el «1», prueba «Tempo ×2 / ÷2», cambia los tiempos por compás o usa «Mover el 1».';
 }
 
 function renderReview() {
@@ -512,6 +795,10 @@ function renderReview() {
   el.resetGrid.disabled = state.busy || !r;
   el.selMeter.disabled = dis;
   el.metro.disabled = !hasBeats;
+  el.bpmInput.disabled = state.busy || !r;
+  el.bpmApply.disabled = state.busy || !r || parseBpm(el.bpmInput.value) === null;
+  el.tap.disabled = state.busy || !r;
+  el.bpmInput.placeholder = r && r.bpm > 0 ? formatNumber(r.bpm, 1) : 'BPM';
   el.reviewBusy.hidden = !state.busy;
   if (state.busy) el.reviewPanel.setAttribute('aria-busy', 'true');
   else el.reviewPanel.removeAttribute('aria-busy');
@@ -526,7 +813,7 @@ function renderCut() {
     el.barsValue.textContent = String(c.n);
     el.manualNote.hidden = true;
   } else {
-    const ok = Number.isFinite(c.approx);
+    const ok = hasBars && Number.isFinite(c.approx);
     el.barsValue.textContent = ok ? `≈${formatNumber(c.approx, 1)}` : '–';
     el.manualNote.hidden = false;
     el.manualNote.textContent = ok ? `Ajuste manual ≈ ${formatBars(Math.max(0, c.approx))}` : 'Ajuste manual';
@@ -538,28 +825,131 @@ function renderCut() {
     chip.disabled = !hasBars || v > maxN;
     chip.setAttribute('aria-pressed', String(c.mode === 'bars' && c.n === v));
   }
-  el.readout.textContent = cutReadout(c.time, state.song.duration);
+  const plan = currentPlan();
+  const withMeter = state.mode2 && meterApplies(plan);
+  el.readout.textContent = cutReadout(c.time, state.song.duration, withMeter ? plan.outputDuration : undefined);
+  el.previewHelp.textContent = withMeter
+    ? 'Reproduce los últimos 8 segundos con el corte, el fade y el compás nuevo aplicados.'
+    : 'Reproduce los últimos 8 segundos con el corte y el fade aplicados.';
   const hasGrid = !!(state.result && state.result.beats && state.result.beats.length > 1);
   el.beatPrev.disabled = el.beatNext.disabled = !hasGrid;
   el.barPrev.disabled = el.barNext.disabled = !hasGrid || !(state.result.downbeats || []).length;
+}
+
+function renderMeter() {
+  const on = state.mode2;
+  el.panelMeter.dataset.on = String(on);
+  el.mode2.checked = on;
+  el.mode2Body.hidden = !on;
+  el.mode2Off.hidden = on;
+  el.xfadeValue.textContent = `${state.xfadeMs} ms`;
+  el.xfade.setAttribute('aria-valuetext', `${state.xfadeMs} milisegundos`);
+  const r = state.result;
+  const tm = currentTarget();
+  const plan = r && state.song ? currentPlan() : null;
+  const m = plan && plan.meter;
+  const applies = on && meterApplies(plan);
+  renderAmountChips(tm, m);
+  el.meterOther.hidden = tm.amount !== 'other';
+  renderLegend(applies ? m : null, tm);
+  el.wavePreview.hidden = !applies;
+  el.meterPreviewLabel.textContent = el.wavePreviewLabel.textContent = meterPreviewText();
+  if (!on || !r || !state.song) return;
+  // sin beats ni compases no hay «Original → Nuevo» que contar: solo el aviso
+  const noGrid = !!(m && (m.error === METER_MESSAGES.noBeats || m.error === METER_MESSAGES.noBars));
+  el.meterSummary.hidden = noGrid;
+  el.meterChange.textContent = meterChangeLabel(r.beatsPerBar, tm.num, tm.den);
+  const d = describeMeterChange(r.beatsPerBar, tm.num, tm.den);
+  const desc = !d.error && d.delta !== 0 ? d.text : '';
+  el.meterDesc.textContent = desc;
+  el.meterDesc.hidden = !desc;
+  if (applies) {
+    const before = state.mode1 && state.cut ? state.cut.time : state.song.duration;
+    el.meterStats.textContent = `${barsChangedText(m.barsChanged)} · dura ${durationChange(before, plan.outputDuration)}`;
+  }
+  el.meterStats.hidden = !applies;
+  const msg = m ? m.error || (applies ? '' : m.info) || '' : '';
+  el.meterMsg.textContent = msg;
+  el.meterMsg.dataset.kind = m && m.error ? 'error' : 'info';
+  el.meterMsg.hidden = !msg;
+  el.meterNum.setAttribute('aria-invalid', String(tm.amount === 'other' && !!(m && m.error)));
+  el.meterPreview.disabled = !applies;
+}
+
+// Botones «½ tiempo (corchea) → 7/8»…: el resultado sale del compás detectado (en 3/4: ½ tiempo → 5/8)
+function renderAmountChips(tm, meterPlan) {
+  const r = state.result;
+  const chips = new Map(meterAmountChips(r ? r.beatsPerBar : 4).map((c) => [c.id, c]));
+  const otherOk = tm.amount === 'other' && Number.isFinite(tm.num) && Number.isFinite(tm.den) && !(meterPlan && meterPlan.error);
+  for (const b of el.meterChips.querySelectorAll('[data-amount]')) {
+    const c = chips.get(b.dataset.amount);
+    b.hidden = !c;
+    if (!c) continue;
+    const res = c.id === 'other' ? (otherOk ? `→ ${meterLabel(tm.num, tm.den)}` : '') : `→ ${c.result}`;
+    const out = b.querySelector('.amt-res');
+    out.textContent = res;
+    out.hidden = !res;
+    b.setAttribute('aria-pressed', String(tm.amount === c.id));
+  }
+}
+
+// Leyenda bajo la onda: qué significa el rojo (o el verde) que se ve en cada compás
+function renderLegend(meterPlan, tm) {
+  if (!meterPlan) {
+    el.waveLegend.hidden = true;
+    return;
+  }
+  const d = describeMeterChange(state.result.beatsPerBar, tm.num, tm.den);
+  const repeat = meterPlan.delta > 0;
+  el.waveLegendSwatch.dataset.kind = repeat ? 'repeated' : 'removed';
+  el.waveLegendText.textContent = `${repeat ? 'En verde' : 'En rojo'}: ${d.text.charAt(0).toLowerCase()}${d.text.slice(1).replace(/\.$/, '')}`;
+  el.waveLegend.hidden = false;
+}
+
+// "Escuchar en 7/8" (o el texto genérico si el compás elegido no vale)
+function meterPreviewText() {
+  if (player.previewTag === 'meter') return 'Detener';
+  const tm = currentTarget();
+  const plan = state.result && state.song ? currentPlan() : null;
+  return state.mode2 && meterApplies(plan) ? `Escuchar en ${meterLabel(tm.num, tm.den)}` : 'Escuchar con el nuevo compás';
 }
 
 function barsRemovedForName() {
   const c = state.cut;
   if (!c) return 0;
   if (c.mode === 'bars') return c.n;
+  if (maxBars() < 1) return 0;   // sin compases que quitar, el corte a mano no se cuenta en compases
   return Number.isFinite(c.approx) ? Math.round(c.approx * 10) / 10 : 0;
 }
 
 function outputName() {
   const opt = exportOptions(state.format);
-  return safe(() => suggestFileName(state.song.name, { barsRemoved: barsRemovedForName(), format: opt.format }),
-    `edit.${opt.format}`);
+  const plan = currentPlan();
+  const tm = currentTarget();
+  const meter = state.mode2 && meterApplies(plan) ? { num: tm.num, den: tm.den } : null;
+  return safe(() => suggestFileName(state.song.name, {
+    barsRemoved: state.mode1 ? barsRemovedForName() : null, format: opt.format, meter,
+  }), `edit.${opt.format}`);
 }
 
 function renderOutName() {
   if (!state.song || !state.cut) return;
   el.outName.textContent = outputName();
+}
+
+// "7/8 · −2 compases · dura 1:04 → 0:51"
+function summaryText(plan) {
+  const parts = [];
+  if (state.mode2 && meterApplies(plan)) {
+    const tm = currentTarget();
+    parts.push(`Compás ${meterLabel(tm.num, tm.den)}`);
+  }
+  if (state.mode1 && state.cut) {
+    const n = barsRemovedForName();
+    parts.push(n > 0 ? `−${formatBars(n)} del final` : 'corte a mano');
+  }
+  parts.push(`dura ${durationChange(state.song.duration, plan.outputDuration)}`);
+  return parts.join(' · ');
 }
 
 function renderSave() {
@@ -570,7 +960,24 @@ function renderSave() {
   el.tagsNote.textContent = has
     ? 'Se copian título, artista, álbum y carátula; se descartan los datos de análisis de otros programas.'
     : 'El archivo original no tiene etiquetas ID3 que conservar.';
-  el.exportBtn.disabled = state.exporting || state.phase !== 'ready';
+  const plan = currentPlan();
+  const blocker = plan ? exportBlocker(plan, { mode1: state.mode1, mode2: state.mode2 }) : null;
+  el.exportBtn.disabled = state.exporting || state.phase !== 'ready' || !!blocker;
+  const hint = blocker || state.exportError;
+  el.exportHint.textContent = hint || '';
+  el.exportHint.hidden = !hint;
+  el.exportHint.dataset.kind = !blocker && state.exportError ? 'error' : 'info';
+  el.outNameLine.hidden = !!blocker;
+  if (plan && !blocker) {
+    el.resultSummary.textContent = summaryText(plan);
+    el.resultSummary.hidden = false;
+    // duración exacta de la salida (la usan las pruebas de extremo a extremo)
+    el.resultSummary.dataset.outputSec = plan.outputDuration.toFixed(6);
+    el.resultSummary.dataset.barsChanged = String(plan.meter ? plan.meter.barsChanged : 0);
+  } else {
+    el.resultSummary.hidden = true;
+    delete el.resultSummary.dataset.outputSec;
+  }
   renderOutName();
 }
 
@@ -578,14 +985,17 @@ function renderAllControls() {
   el.fade.value = String(state.fadeIdx);
   el.curve.value = state.curve;
   el.snap.checked = state.snap;
+  el.xfade.value = String(state.xfadeMs);
+  el.meterNum.value = state.newMeter.num;
+  el.meterDen.value = state.newMeter.den;
   wave.setSnap(state.snap);
   setMetronome(state.metronome, { silent: true });
   el.timeTotal.textContent = formatTime(state.song.duration);
+  renderMode1Switch();
   renderFade();
-  renderCut();
   renderInfo();
   renderReview();
-  renderSave();
+  onPlanChanged({ stopPreview: false });
   renderTransport();
   renderZoomButtons();
 }
@@ -593,12 +1003,17 @@ function renderAllControls() {
 function renderTransport() {
   const playing = player.playing;
   const previewing = playing && player.mode === 'preview';
-  el.play.setAttribute('aria-pressed', String(playing && !previewing));
-  el.play.dataset.state = playing && !previewing ? 'playing' : 'paused';
-  el.play.setAttribute('aria-label', playing && !previewing ? 'Pausa' : 'Reproducir');
-  el.playLabel.textContent = playing && !previewing ? 'Pausa' : 'Reproducir';
-  el.preview.dataset.state = previewing ? 'playing' : 'idle';
-  el.previewLabel.textContent = previewing ? 'Detener' : 'Escuchar el final';
+  const tag = player.previewTag;
+  // durante una vista previa el botón principal la detiene: se muestra como tal
+  const label = previewing ? 'Detener' : playing ? 'Pausa' : 'Reproducir';
+  el.play.setAttribute('aria-pressed', String(playing));
+  el.play.dataset.state = playing ? 'playing' : 'paused';
+  el.play.setAttribute('aria-label', previewing ? 'Detener la vista previa' : label);
+  el.playLabel.textContent = label;
+  el.preview.dataset.state = tag === 'end' ? 'playing' : 'idle';
+  el.previewLabel.textContent = tag === 'end' ? 'Detener' : 'Escuchar el final';
+  el.meterPreview.dataset.state = el.wavePreview.dataset.state = tag === 'meter' ? 'playing' : 'idle';
+  el.meterPreviewLabel.textContent = el.wavePreviewLabel.textContent = meterPreviewText();
 }
 
 function renderZoomButtons() {
@@ -609,18 +1024,22 @@ function renderZoomButtons() {
 
 // ---------- revisar compases (worker) ----------
 
-async function runGridJob(message, job) {
+// describe(result) opcional → { text, kind } del aviso final (por defecto "Cuadrícula actualizada…")
+async function runGridJob(message, job, describe = null) {
   if (!client || state.busy || !state.result) return;
   const gen = state.gen;
   state.busy = true;
   renderReview();
-  announce(message);
+  announce(message, 'info', { visual: false });
   try {
     const result = await job();
     if (gen !== state.gen) return;
     state.busy = false;
     applyResult(result);
-    announce(`Cuadrícula actualizada: ${formatBpm(result.bpm)} · ${meterText(result.beatsPerBar)}`);
+    renderSave();
+    const d = describe && describe(result);
+    if (d) announce(d.text, d.kind);
+    else announce(`Cuadrícula actualizada: ${formatBpm(result.bpm)} · ${meterText(result.beatsPerBar)}`);
   } catch (err) {
     if (gen !== state.gen) return;
     announce(errorMessage('retrack', err), 'error');
@@ -636,6 +1055,30 @@ function meterOption() {
   return state.meterChoice === 'auto' ? 'auto' : Number(state.meterChoice);
 }
 
+function retrackAt(bpmHint) {
+  runGridJob(`Recalculando a ≈ ${formatNumber(bpmHint, 1)} BPM…`, async () => {
+    const res = await client.retrack({ bpmHint, strict: true });
+    state.tempoChanged = true;
+    return res;
+  }, (res) => tempoResultNotice(res, bpmHint));
+}
+
+// Aviso tras pedir un tempo: si la cuadrícula no quedó cerca del tempo pedido, se dice (no "actualizada")
+function tempoResultNotice(res, bpmHint) {
+  const asked = `${formatNumber(bpmHint, 1)} BPM`;
+  if (!(res && res.beats && res.beats.length > 1)) {
+    return { kind: 'error', text: `No se encontró un pulso cerca de ${asked}: este audio no tiene ataques claros. Coloca el corte a mano.` };
+  }
+  const ratio = res.bpm / bpmHint;
+  if (!(ratio >= TEMPO_MATCH[0] && ratio <= TEMPO_MATCH[1])) {
+    return {
+      kind: 'error',
+      text: `No se encontró un pulso cerca de ${asked}: la cuadrícula quedó en ${formatBpm(res.bpm)}. Escucha con el clic o pulsa «Restablecer».`,
+    };
+  }
+  return null;
+}
+
 function changeTempo(factor) {
   const r = state.result;
   if (!r || !(r.bpm > 0)) return;
@@ -644,11 +1087,34 @@ function changeTempo(factor) {
     announce('Ese tempo queda fuera del rango que se puede detectar.', 'error');
     return;
   }
-  runGridJob(`Recalculando a ≈ ${formatNumber(bpmHint, 1)} BPM…`, async () => {
-    const res = await client.retrack({ bpmHint, strict: true });
-    state.tempoChanged = true;
-    return res;
-  });
+  retrackAt(bpmHint);
+}
+
+// "Tempo manual": el BPM escrito o marcado con toques
+function applyManualTempo() {
+  if (!state.result || state.busy) return;
+  const bpm = parseBpm(el.bpmInput.value);
+  if (bpm === null) {
+    announce(`Escribe un tempo entre ${MANUAL_BPM.min} y ${MANUAL_BPM.max} BPM.`, 'error');
+    el.bpmInput.focus();
+    return;
+  }
+  retrackAt(bpm);
+}
+
+// "Marcar tempo": mediana de los últimos toques
+function tapBeat() {
+  if (!state.result || state.busy) return;
+  const res = tapTempo(state.taps, performance.now());
+  state.taps = res.taps;
+  if (res.bpm === null) {
+    el.tapValue.textContent = 'Sigue tocando…';
+    return;
+  }
+  const bpm = clamp(res.bpm, MANUAL_BPM.min, MANUAL_BPM.max);
+  el.tapValue.textContent = `≈ ${formatNumber(bpm, 1)} BPM`;
+  el.bpmInput.value = formatNumber(bpm, 1);
+  renderReview();
 }
 
 function relabel(message) {
@@ -677,6 +1143,9 @@ function resetGrid() {
   state.forced = [];
   state.meterChoice = 'auto';
   el.selMeter.value = 'auto';
+  el.bpmInput.value = '';
+  state.taps = [];
+  el.tapValue.textContent = 'Toca al ritmo';
   const needRetrack = state.tempoChanged;
   runGridJob('Restableciendo la detección…', async () => {
     if (needRetrack) await client.retrack({});
@@ -697,6 +1166,17 @@ function setMetronome(on, { silent = false } = {}) {
   }
 }
 
+// iOS sin navigator.audioSession: Web Audio obedece al interruptor de silencio y no hay forma de saberlo
+let silentHintShown = false;
+function iosSilentHint() {
+  if (silentHintShown) return;
+  const nav = globalThis.navigator || {};
+  const ios = /iPad|iPhone|iPod/.test(nav.userAgent || '') || (nav.platform === 'MacIntel' && nav.maxTouchPoints > 1);
+  if (!ios || nav.audioSession) return;
+  silentHintShown = true;
+  announce('Si no oyes nada, quita el modo silencio del iPhone o iPad.');
+}
+
 function togglePlay() {
   if (state.phase !== 'ready') return;
   if (player.playing && player.mode === 'preview') {
@@ -704,30 +1184,60 @@ function togglePlay() {
     return;
   }
   player.toggle();
+  if (player.playing) iosSilentHint();
 }
 
-function togglePreview() {
-  if (state.phase !== 'ready' || !state.cut) return;
-  if (player.playing && player.mode === 'preview') {
-    player.stop();
-    return;
-  }
+function stopPreviewPlayback() {
+  if (player.playing && player.mode === 'preview') player.stop();
+}
+
+// Vista previa del resultado (mismo plan y mismo render que la exportación), renderizada por tramos mientras suena.
+// 'end': los últimos 8 s de la salida; 'meter': desde el cabezal con el compás nuevo.
+// at (opcional): instante del original desde el que sonar (un toque en la onda durante la vista previa).
+function startPreview(kind, { at = null } = {}) {
+  if (state.phase !== 'ready') return;
+  const plan = currentPlan();
+  if (!plan || !(plan.outputDuration > 0)) return;
+  if (kind === 'meter' && !meterApplies(plan)) return;
   const { buffer } = state.song;
-  const cut = state.cut.time;
-  const start = Math.max(0, cut - PREVIEW_SEC);
+  const sr = buffer.sampleRate;
+  const out = renderedLength(plan.segments, sr) / sr;
+  if (!(out > 0)) return;
+  let from;
+  if (Number.isFinite(at)) from = previewStartTime(plan.segments, at, out, PREVIEW_SEC);
+  else if (kind === 'end') from = Math.max(0, out - PREVIEW_SEC);
+  else from = previewStartTime(plan.segments, player.currentTime, out, PREVIEW_SEC);
   try {
-    const out = renderEdit(channelsOf(buffer), buffer.sampleRate, {
-      cutTime: cut, fadeSec: currentFadeSec(), curve: state.curve, startTime: start,
-    });
-    const v = wave.getView();
-    if (start < v.start || cut > v.end) {
-      const pad = (cut - start) * 0.15;
-      wave.setView(Math.min(v.start, start - pad), Math.max(cut + pad, Math.min(v.end, cut + (cut - start))));
+    const chans = channelsOf(buffer);
+    const opts = { crossfadeSec: plan.crossfadeSec, fadeOutSec: plan.fadeOutSec, curve: state.curve };
+    const render = (a, b) => renderSegments(chans, sr, plan.segments, { ...opts, from: a, to: b });
+    const toSource = outputToSourceFn(plan.segments);
+    const clicks = mapBeatsToOutput(plan.segments, (state.result && state.result.beats) || [], state.downbeatSet);
+    // que se vea lo que va a sonar (salvo si viene de un toque en la onda: el usuario ya está mirando ahí)
+    const s0 = toSource(from);
+    if (!Number.isFinite(at) && kind === 'end') {
+      const s1 = plan.sourceEnd;
+      const v = wave.getView();
+      if (s0 < v.start || s1 > v.end) {
+        const pad = (s1 - s0) * 0.15;
+        wave.setView(Math.min(v.start, s0 - pad), Math.max(s1 + pad, Math.min(v.end, s1 + (s1 - s0))));
+      }
+    } else if (!Number.isFinite(at)) {
+      wave.reveal(s0);
     }
-    player.playPreview(out, buffer.sampleRate, start);
+    if (player.playPreview(null, sr, from, { toSource, clicks, tag: kind, render, end: out })) iosSilentHint();
   } catch (err) {
     announce(errorMessage('preview', err), 'error');
   }
+}
+
+function togglePreview(kind) {
+  if (state.phase !== 'ready') return;
+  if (player.previewTag === kind) {
+    player.stop();
+    return;
+  }
+  startPreview(kind);
 }
 
 function onTimeUpdate() {
@@ -767,8 +1277,8 @@ function renderExportProgress(fraction) {
   if (fraction == null) {
     el.exportProgress.hidden = true;
     el.exportLabel.textContent = 'Descargar';
-    el.exportBtn.disabled = state.phase !== 'ready';
     el.exportBtn.removeAttribute('aria-busy');
+    renderSave();
     return;
   }
   const pct = Math.round(clamp(fraction, 0, 1) * 100);
@@ -782,37 +1292,42 @@ function renderExportProgress(fraction) {
 
 async function doExport() {
   if (state.exporting || state.phase !== 'ready' || !state.cut) return;
+  const plan = currentPlan();
+  if (!plan || exportBlocker(plan, { mode1: state.mode1, mode2: state.mode2 })) return;
   const gen = state.gen;
   state.exporting = true;
+  state.exportError = '';
   if (player.playing) player.pause();
   renderExportProgress(0);
   try {
     await nextFrame();
-    const { buffer, bytes } = state.song;
+    const { buffer, tagBytes } = state.song;
     const opt = exportOptions(state.format);
-    const channels = renderEdit(channelsOf(buffer), buffer.sampleRate, {
-      cutTime: state.cut.time, fadeSec: currentFadeSec(), curve: state.curve,
+    const name = outputName();
+    // la salida se lee por tramos al codificar: no hay un render completo en memoria
+    const source = segmentSource(channelsOf(buffer), buffer.sampleRate, plan.segments, {
+      crossfadeSec: plan.crossfadeSec, fadeOutSec: plan.fadeOutSec, curve: state.curve,
     });
-    if (gen !== state.gen) return;
-    renderExportProgress(0.05);
     const blob = await exportAudio({
-      channels,
+      source,
       sampleRate: buffer.sampleRate,
       format: opt.format,
       bitDepth: opt.bitDepth,
       kbps: opt.kbps,
-      sourceBytes: bytes,
+      tagBytes: state.keepTags ? tagBytes : null,
       keepTags: state.keepTags && state.song.hasTags,
       onProgress: (f) => {
-        if (gen === state.gen) renderExportProgress(0.05 + 0.95 * clamp(Number(f) || 0, 0, 1));
+        if (gen === state.gen) renderExportProgress(clamp(Number(f) || 0, 0, 1));
       },
     });
     if (gen !== state.gen) return;
-    const name = outputName();
     triggerDownload(blob, name);
     announce(`Listo: se descargó «${name}» (${formatFileSize(blob.size)}).`);
   } catch (err) {
-    if (gen === state.gen) announce(errorMessage('export', err), 'error');
+    if (gen === state.gen) {
+      state.exportError = errorMessage('export', err);
+      announce(state.exportError, 'error');
+    }
   } finally {
     state.exporting = false;
     renderExportProgress(null);
@@ -855,21 +1370,22 @@ function bind() {
     if (f) loadFile(f);
   });
 
-  // desbloqueo de audio en iOS: primer gesto con canción cargada
-  const unlock = () => {
-    if (state.song && state.song.buffer) player.unlock();
-  };
-  document.addEventListener('pointerup', unlock, true);
-  document.addEventListener('keydown', unlock, true);
+  // avisos: se cierran con la X (el resto del aviso deja pasar los toques)
+  el.toastClose.addEventListener('click', hideToast);
 
   // forma de onda
   wave.addEventListener('seek', (e) => {
+    const tag = player.previewTag;
+    if (tag) player.stop();
     player.seek(e.detail.time);
+    // durante una vista previa (final o compás nuevo) sigue sonando el resultado desde el punto tocado, nunca el
+    // original; si el punto ya no está en la salida, los últimos segundos
+    if (tag) startPreview(tag, { at: e.detail.time });
     onTimeUpdate();
   });
   wave.addEventListener('cutchange', (e) => {
     const { time, snapped, beatIndex, phase } = e.detail;
-    if (phase === 'start') return;
+    if (phase === 'start' || !state.mode1) return;
     if (phase === 'end' && !Number.isFinite(time)) return;
     if (snapped && beatIndex >= 0) setCutAtBeat(beatIndex);
     else setCutManual(time);
@@ -880,7 +1396,7 @@ function bind() {
   el.zoomOut.addEventListener('click', () => wave.zoomBy(2));
   el.zoomAll.addEventListener('click', () => wave.showAll());
   el.zoomCut.addEventListener('click', () => {
-    if (!state.cut) return;
+    if (!state.cut || !state.mode1) return;
     const v = wave.getView();
     const span = v.end - v.start;
     wave.centerOn(state.cut.time, span > 45 ? medianBarLength() * 8 : span);
@@ -895,6 +1411,24 @@ function bind() {
   // revisar
   el.tempoDouble.addEventListener('click', () => changeTempo(2));
   el.tempoHalf.addEventListener('click', () => changeTempo(0.5));
+  el.bpmInput.addEventListener('input', () => {
+    el.bpmApply.disabled = state.busy || !state.result || parseBpm(el.bpmInput.value) === null;
+  });
+  el.bpmInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      applyManualTempo();
+    }
+  });
+  el.bpmApply.addEventListener('click', applyManualTempo);
+  // el toque cuenta al bajar el dedo (menos retardo que el clic); el teclado activa el botón con 'click'
+  el.tap.addEventListener('pointerdown', (e) => {
+    if (e.pointerType === 'mouse' && e.button !== 0) return;
+    tapBeat();
+  });
+  el.tap.addEventListener('click', (e) => {
+    if (e.detail === 0) tapBeat();
+  });
   el.selMeter.addEventListener('change', () => {
     state.meterChoice = el.selMeter.value;
     state.forced = [];
@@ -905,7 +1439,8 @@ function bind() {
   el.thisOne.addEventListener('click', thisBeatIsOne);
   el.resetGrid.addEventListener('click', resetGrid);
 
-  // corte
+  // modo 1: corte
+  el.mode1.addEventListener('change', () => setMode1(el.mode1.checked));
   el.barsMinus.addEventListener('click', () => changeBars(-1));
   el.barsPlus.addEventListener('click', () => changeBars(1));
   for (const n of BAR_CHIPS) {
@@ -933,20 +1468,68 @@ function bind() {
     savePrefs();
   });
 
-  // final
+  // modo 1: final
   el.fade.addEventListener('input', () => {
     state.fadeIdx = clamp(Number(el.fade.value) || 0, 0, FADE_BEAT_STEPS.length - 1);
-    if (player.playing && player.mode === 'preview') player.stop();
     renderFade();
+    onPlanChanged();
     savePrefs();
   });
   el.curve.addEventListener('change', () => {
     state.curve = FADE_CURVES_UI.includes(el.curve.value) ? el.curve.value : 'smooth';
-    if (player.playing && player.mode === 'preview') player.stop();
+    stopPreviewPlayback();
     renderFade();
     savePrefs();
   });
-  el.preview.addEventListener('click', togglePreview);
+  el.preview.addEventListener('click', () => togglePreview('end'));
+
+  // modo 2: recortar cada compás
+  el.mode2.addEventListener('change', () => setMode2(el.mode2.checked));
+  for (const a of METER_AMOUNTS) {
+    // "½ tiempo (corchea) → 7/8": el resultado se rellena en renderAmountChips
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'chip amount-chip';
+    b.dataset.amount = a.id;
+    b.setAttribute('aria-pressed', 'false');
+    const txt = document.createElement('span');
+    txt.className = 'amt-text';
+    const main = document.createElement('span');
+    main.className = 'amt-main';
+    main.textContent = a.main;
+    txt.append(main);
+    if (a.note) {
+      const note = document.createElement('span');
+      note.className = 'amt-note';
+      note.textContent = a.note;
+      txt.append(' ', note);
+    }
+    const res = document.createElement('span');
+    res.className = 'amt-res num';
+    b.append(txt, ' ', res);
+    el.meterChips.append(b);
+  }
+  el.meterChips.addEventListener('click', (e) => {
+    const b = e.target.closest('[data-amount]');
+    if (b) chooseMeter(b.dataset.amount);
+  });
+  el.meterNum.addEventListener('input', () => {
+    state.newMeter.num = el.meterNum.value;
+    savePrefs();
+    onPlanChanged();
+  });
+  el.meterDen.addEventListener('change', () => {
+    state.newMeter.den = el.meterDen.value;
+    savePrefs();
+    onPlanChanged();
+  });
+  el.xfade.addEventListener('input', () => {
+    state.xfadeMs = clamp(Math.round(Number(el.xfade.value) || XFADE_MS.def), XFADE_MS.min, XFADE_MS.max);
+    savePrefs();
+    onPlanChanged();
+  });
+  el.meterPreview.addEventListener('click', () => togglePreview('meter'));
+  el.wavePreview.addEventListener('click', () => togglePreview('meter'));
 
   // guardar
   el.formats.addEventListener('change', (e) => {
@@ -971,23 +1554,27 @@ function bind() {
     });
     if (!action || state.phase !== 'ready') return;
     e.preventDefault();
-    if (e.repeat && (action === 'toggle-play' || action === 'metronome' || action === 'preview')) return;
+    if (e.repeat && (action === 'toggle-play' || action === 'metronome' || action === 'preview' || action === 'tap-tempo')) return;
+    const cutKeys = state.mode1;
     switch (action) {
       case 'toggle-play': togglePlay(); break;
-      case 'cut-beat-prev': nudgeBeat(-1); break;
-      case 'cut-beat-next': nudgeBeat(1); break;
-      case 'cut-bar-prev': nudgeBar(-1); break;
-      case 'cut-bar-next': nudgeBar(1); break;
+      case 'cut-beat-prev': if (cutKeys) nudgeBeat(-1); break;
+      case 'cut-beat-next': if (cutKeys) nudgeBeat(1); break;
+      case 'cut-bar-prev': if (cutKeys) nudgeBar(-1); break;
+      case 'cut-bar-next': if (cutKeys) nudgeBar(1); break;
       case 'zoom-in': wave.zoomBy(0.5); break;
       case 'zoom-out': wave.zoomBy(2); break;
       case 'metronome': if (!el.metro.disabled) setMetronome(!state.metronome); break;
-      case 'preview': togglePreview(); break;
+      case 'preview':
+        // lo principal es el recorte de cada compás: P lo escucha desde el cabezal; sin él, el final.
+        // Con una vista previa sonando, P la para.
+        if (player.previewTag) player.stop();
+        else if (state.mode2 && !el.meterPreview.disabled) togglePreview('meter');
+        else if (state.mode1) togglePreview('end');
+        break;
+      case 'tap-tempo': if (!el.tap.disabled) tapBeat(); break;
       default: break;
     }
-  });
-  // que Espacio no "pulse" además el botón con foco al soltar la tecla
-  document.addEventListener('keyup', (e) => {
-    if (e.key === ' ' && state.phase === 'ready' && e.target && e.target.tagName === 'BUTTON') e.preventDefault();
   });
 }
 

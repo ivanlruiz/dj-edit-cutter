@@ -8,6 +8,11 @@
 //    métrico sobre tempogramas de autocorrelación: ACF(L) + subdivisión (L/2 o L/3) en ventana corta + 2L y compás
 //    (3L o 4L, elegido una vez para toda la canción) en ventana larga; así una figura rítmica 5:4 o 3:2 repetida no
 //    se confunde con un cambio de tempo. En los últimos compases el camino se relaja (ritardando, fermata).
+//    Si aun así el camino pasa la mayor parte de la canción en otro nivel métrico (×2/3 o ×4/3 del tempo global: una
+//    hemiolia, un 3/4 sentido en 6/8), se decodifica otra vez limitado a [0.785, 1.27] × tempo global salvo en la zona
+//    final; un cambio de tempo real en una sección no llega a activarlo. Al revés, un tramo a < 0.71× el tempo global
+//    (fuera de la zona final) cuyos contratiempos suenan como beats es la MITAD de una sección más rápida (92 → 115:
+//    el camino cabe en 57): se decodifica otra vez sin ese nivel (ver sectionCheck).
 // 3. DP de Ellis con periodo local τ(t): cum[i] = local[i] + max_j (cum[j] − α·ln²((i−j)/τ(i))), j ∈ [i−2τ, i−τ/2].
 //    Segunda pasada con τ(t) re-estimado de los intervalos de la primera.
 // 4. Octava: si los beats alternos son sistemáticamente flojos (→ mitad) o los contratiempos igual de fuertes que los
@@ -15,10 +20,11 @@
 //    usa una rejilla de tempo constante y la confianza sale baja.
 // 5. Bordes: nada fuera de [musicStart, musicEnd]; el último beat decodificado se elige en el último onset
 //    significativo (o el beat anterior si el golpe es anticipado); después se extrapola por la cola resonante mientras
-//    suene (no tras un corte seco ni en silencio); los beats débiles del principio se recortan.
+//    suene (no tras un corte seco ni en silencio, ni sobre los aplausos de un directo); los beats débiles del principio
+//    se recortan.
 // 6. Posición fina por interpolación parabólica del pico de onset más cercano (±2 tramas).
 import { estimateTempo, tempogram } from './tempo.js';
-import { findMusicBounds, findLastOnset } from './bounds.js';
+import { findMusicBounds, findLastOnset, findNoiseTail } from './bounds.js';
 import { pickPeaks } from './features.js';
 
 export const DP_DEFAULTS = {
@@ -48,8 +54,19 @@ export const DP_DEFAULTS = {
   pathPrior: 1, // atracción hacia el tempo global: −pathPrior·½·(d/0.5)² por segundo
   endBeats: 8, // en los últimos endBeats beats antes del último onset el camino se relaja (ritardando final):
   endSigmaMult: 2, // σ × endSigmaMult y sin atracción al tempo global
+  pathCore: 'auto', // 'auto' | 'always' | 'off': núcleo del camino de tempo (ver pathCoreLo / pathCoreMaxOff)
+  pathCoreLo: -0.35, // núcleo: [0.785, 1.27] × el tempo global fuera de la zona final (ritardando); deja fuera con
+  pathCoreHi: 0.35, //   margen los niveles ×3/4 y ×4/3 (±0.415 octavas) y cubre derivas y acelerandos reales
+  pathCoreMaxOff: 0.5, // 'auto': si más de la mitad de los beats (fuera de la zona final) quedan fuera del núcleo, el
+  //                      camino se ha ido a otro nivel métrico (×2/3, ×4/3: hemiolias, 6/8) y se decodifica con núcleo
+  sectionCheck: true, // tramo lento (< sectionLo octavas durante >= sectionMinBeats beats, fuera de la zona final)
+  sectionLo: -0.5, //     con evidencia de doble: se decodifica otra vez con el camino >= sectionCoreLo octavas
+  sectionMinBeats: 8, //  fuera de la zona final (la mitad de una sección más rápida no cabe)
+  sectionCoreLo: -0.45,
   hintLo: -0.52, // con bpmHint (strict o no): tempo local en [0.7, 1.3] × el tempo de partida
   hintHi: 0.38,
+  strictLo: 0.8, // strict: tempo local en [strictLo, strictHi] × bpmHint salvo en la zona final (ritardando)
+  strictHi: 1.25,
   // DP
   tightness: 300,
   passes: 2,
@@ -64,7 +81,11 @@ export const DP_DEFAULTS = {
   strengthHalf: 3, // strength = s / (s + strengthHalf): 0.5 cuando el pico vale 3× la media local
   // octava (mitad / doble): log-odds = k·ln(evidencia / umbral) + prior(nuevo) − prior(actual)
   octaveCheck: true,
-  octaveThreshold: 0.45,
+  octaveHalfThreshold: 0.48, // mitad si la paridad (beats alternos flojos / fuertes) queda por debajo
+  octaveDoubleThreshold: 0.5, // doble si los contratiempos superan esta fracción de los beats. Con 0.45 / 0.45 el
+  //   funk se doblaba en masters limitados (el limitador iguala las semicorcheas): medido con tools/bench.js --analyze,
+  //   0.48 / 0.5 corrige 8 casos (funk, balada y acústica masterizados, x3_funk sin masterizar) y estropea 1 (rock a
+  //   165 con limit12, que ya partía de un tempo global a la mitad y ahora no se dobla)
   octaveEvidenceWeight: 3,
   octavePriorCenter: 115,
   octavePriorSigma: 0.8, // octavas
@@ -158,6 +179,8 @@ function acfAt(row, lag) {
 
 /**
  * Camino de tempo suave: Viterbi sobre un tempograma de ventanas cortas. Estados = log2(bpm / bpm0) en [lo, hi].
+ * Con opts.coreLo / opts.coreHi (octavas) el camino queda dentro de [coreLo, coreHi] salvo en la zona final
+ * (ritardando, fermata: opts.endFrame), donde el rango se abre de forma gradual hasta [lo, hi].
  * @param {Float32Array} env envolvente (tramas de la zona)
  * @returns {Float64Array} periodo local en tramas, una entrada por trama de env
  */
@@ -235,7 +258,16 @@ export function tempoPath(env, fps, bpm0, opts = {}) {
   let prev = new Float64Array(nS);
   let cur = new Float64Array(nS);
   const back = new Array(nW);
-  for (let s = 0; s < nS; s++) prev[s] = o.pathWeight * obs(0, s) + prior[s];
+  // rango permitido por ventana (núcleo fuera de la zona final)
+  const useCore = Number.isFinite(o.coreLo) && Number.isFinite(o.coreHi);
+  const outside = (w, s) => {
+    if (!useCore) return false;
+    const r = endRamp(w);
+    const d = lo + s * o.pathStep;
+    return d < o.coreLo + (lo - o.coreLo) * r - 1e-9 || d > o.coreHi + (hi - o.coreHi) * r + 1e-9;
+  };
+  const BANNED = -1e12;
+  for (let s = 0; s < nS; s++) prev[s] = outside(0, s) ? BANNED : o.pathWeight * obs(0, s) + prior[s];
   back[0] = null;
   for (let w = 1; w < nW; w++) {
     const bk = new Int16Array(nS);
@@ -253,7 +285,7 @@ export function tempoPath(env, fps, bpm0, opts = {}) {
         const v = prev[k] - d * d * inv2var;
         if (v > best) { best = v; bi = k; }
       }
-      cur[s] = best + o.pathWeight * obs(w, s) + pw * prior[s];
+      cur[s] = outside(w, s) ? BANNED : best + o.pathWeight * obs(w, s) + pw * prior[s];
       bk[s] = bi;
     }
     back[w] = bk;
@@ -346,23 +378,42 @@ function periodFromBeats(beats, n, k, fallback) {
 }
 
 /**
- * Nivel de la trama k sin la componente continua: con las muestras, RMS de x − media en la ventana de la trama; sin
- * ellas, features.rms (que incluye un posible offset DC).
+ * Fracción de beats (antes de la trama endF) cuyo tempo local (mediana de 4 IBI) queda fuera de [lo, hi] octavas
+ * respecto a bpm0.
  */
-function frameLevel(features, samples) {
-  const { rms, hop, frameSize = 1024, sampleRate } = features;
-  if (!samples || !samples.length || Math.abs(samples.length / sampleRate - features.duration) > 0.05) return (k) => rms[k];
-  const half = frameSize / 2;
-  return (k) => {
-    const a = Math.max(0, k * hop - half);
-    const b = Math.min(samples.length, k * hop + half);
-    if (b <= a) return 0;
-    let s = 0;
-    let s2 = 0;
-    for (let i = a; i < b; i++) { s += samples[i]; s2 += samples[i] * samples[i]; }
-    const m = s / (b - a);
-    return Math.sqrt(Math.max(0, s2 / (b - a) - m * m));
-  };
+export function offCoreFraction(beatsF, bpm0, fps, endF, lo, hi) {
+  let n = 0;
+  let off = 0;
+  for (let i = 1; i < beatsF.length; i++) {
+    if (beatsF[i] > endF) break;
+    const ibis = [];
+    for (let k = Math.max(1, i - 2); k <= Math.min(beatsF.length - 1, i + 1); k++) ibis.push(beatsF[k] - beatsF[k - 1]);
+    const d = Math.log2((60 * fps) / median(ibis) / bpm0);
+    n++;
+    if (d < lo || d > hi) off++;
+  }
+  return n ? off / n : 0;
+}
+
+/**
+ * Tramo más largo de beats (antes de la trama endF) cuyo tempo local (mediana de 4 IBI) queda por debajo de lo
+ * octavas respecto a bpm0. @returns {{ from:number, to:number } | null} índices de beat
+ */
+export function slowRun(beatsF, bpm0, fps, endF, lo) {
+  let best = null;
+  let from = -1;
+  for (let i = 1; i < beatsF.length && beatsF[i] <= endF; i++) {
+    const ibis = [];
+    for (let k = Math.max(1, i - 2); k <= Math.min(beatsF.length - 1, i + 1); k++) ibis.push(beatsF[k] - beatsF[k - 1]);
+    const slow = Math.log2((60 * fps) / median(ibis) / bpm0) < lo;
+    if (slow && from < 0) from = i;
+    if ((!slow || i + 1 >= beatsF.length || beatsF[i + 1] > endF) && from >= 0) {
+      const to = slow ? i : i - 1;
+      if (!best || to - from > best.to - best.from) best = { from, to };
+      from = -1;
+    }
+  }
+  return best;
 }
 
 /** Log-prior log-normal del tempo (octavas). */
@@ -424,12 +475,14 @@ export function beatContrast(beatsF, salAt) {
  *   tempi = BPM local por beat; contrast = beatContrast (sin la cola extrapolada); confidence = 0..1 a partir del
  *   contraste (1.5 → 0, ≥ 4 → 1; < 0.5 ≈ "revisa la cuadrícula");
  *   extrapolated = cuántos de los últimos beats se extrapolaron por la cola resonante (sin onsets);
- *   octave = corrección de octava aplicada (null si ninguna; nunca con bpmHint).
+ *   octave = corrección de octava aplicada (null si ninguna; nunca con bpmHint);
+ *   metricLevel = { offCore, bpmBefore } si el camino se volvió a decodificar dentro del núcleo (null si no);
+ *   section = { from, to, mid, bpm } si un tramo lento era la mitad de una sección más rápida (null si no).
  */
 export function trackBeats(features, opts = {}) {
   const o = { ...DP_DEFAULTS };
   for (const [k, v] of Object.entries(opts)) if (v !== undefined && v !== null) o[k] = v;
-  const empty = (bpm = 0) => ({ beats: [], bpm, strength: [], tempi: [], confidence: 0, contrast: 0, extrapolated: 0, octave: null });
+  const empty = (bpm = 0) => ({ beats: [], bpm, strength: [], tempi: [], confidence: 0, contrast: 0, extrapolated: 0, octave: null, metricLevel: null, section: null });
   if (!features || !(features.numFrames > 0) || !(features.fps > 0) || !features.onset) return empty();
   const fps = features.fps;
   const hint = Number.isFinite(o.bpmHint) && o.bpmHint > 0 ? o.bpmHint : null;
@@ -447,7 +500,8 @@ export function trackBeats(features, opts = {}) {
   musicStart = Math.max(0, musicStart);
   musicEnd = Math.min(features.duration, musicEnd);
   if (!(musicEnd > musicStart)) return empty();
-  // tramas válidas: la ventana cae entera dentro del archivo (con offset DC el relleno de ceros da flujo espurio)
+  // tramas válidas: la ventana cae entera dentro del archivo (features ya pone a 0 el flujo de las demás; se mantiene
+  // aquí por si llegan características de otra versión)
   const half = (features.frameSize || 1024) / 2;
   const hop = features.hop || 256;
   const firstValid = Math.ceil(half / hop);
@@ -469,11 +523,10 @@ export function trackBeats(features, opts = {}) {
   if (!(envMax > 0)) return empty(bpm0);
 
   // fin de la evidencia: último onset significativo
-  // (sólo tramas válidas: con offset DC el relleno de ceros del final da un "onset" espurio)
-  // (findLastOnset mira hasta musicEnd + 20 ms: se deja ese margen dentro de las tramas válidas)
+  // (sólo tramas válidas; findLastOnset mira hasta musicEnd + 20 ms: se deja ese margen dentro de ellas)
   const endSearch = Math.min(musicEnd, (f1 - 2) / fps);
   let lastOnset = findLastOnset(features, endSearch);
-  // si ningún pico pasa sus criterios de nivel (p. ej. un offset DC domina el RMS) devuelve el propio límite: entonces
+  // si ningún pico pasa sus criterios (material sin ataques claros) devuelve el propio límite: entonces
   // vale el último pico de onset con altura ≥ 0.2 × P75 de las alturas (su mismo criterio de altura)
   if (lastOnset >= endSearch - 1e-6) {
     const peaks = pickPeaks(features.onset, fps, { threshold: 0.02, relThreshold: 0.5 }).filter((i) => i >= f0 && i <= f1 - 2);
@@ -491,9 +544,16 @@ export function trackBeats(features, opts = {}) {
     return m;
   };
 
+  let useCore = !hint && o.pathCore === 'always';
+  // strict (botones ×2 / ÷2, tempo manual): fuera de la zona final el camino queda en [0.8, 1.25] × el tempo pedido;
+  // con sólo [0.7, 1.3] × bpm0 un tempo pedido un 25–35 % lejos del real acababa en el nivel métrico real (×2/3, ×3/2)
+  const strictCore = strict
+    ? { coreLo: Math.log2((o.strictLo * hint) / bpm0), coreHi: Math.log2((o.strictHi * hint) / bpm0) }
+    : {};
+  let coreOverride = null;
   const decode = (bpmC, steady = false) => {
     // con un tempo indicado por el usuario el camino no se aleja más de ±30 % (se queda en ese nivel métrico)
-    const pathOpts = hint ? { lo: o.hintLo, hi: o.hintHi } : {};
+    const pathOpts = hint ? { lo: o.hintLo, hi: o.hintHi, ...strictCore } : coreOverride || (useCore ? { coreLo: o.pathCoreLo, coreHi: o.pathCoreHi } : {});
     let period = steady ? new Float64Array(n).fill((60 * fps) / bpmC) : tempoPath(env, fps, bpmC, { ...o, ...pathOpts, endFrame: fLast });
     let beatsF = [];
     for (let pass = 0; pass < Math.max(1, o.passes); pass++) {
@@ -512,6 +572,46 @@ export function trackBeats(features, opts = {}) {
   };
 
   let beatsF = decode(bpm0);
+  // nivel métrico: el camino puede asentarse en ×2/3 o ×4/3 del tempo global (una figura de 3 contra 4, un 3/4 sentido
+  // en 6/8) con mucha confianza. El tempo global sólo se equivoca de octava (eso lo corrige la comprobación de octava),
+  // así que si la mayor parte de la canción (fuera del ritardando final) queda fuera de [0.785, 1.27] × tempo global, se
+  // vuelve a decodificar con el camino limitado a ese núcleo. Un cambio de tempo real en una sección no lo activa.
+  let metricLevel = null;
+  if (!hint && o.pathCore === 'auto' && beatsF.length >= 8) {
+    const off = offCoreFraction(beatsF, bpm0, fps, fLast - (o.endBeats * 60 * fps) / bpm0, o.pathCoreLo, o.pathCoreHi);
+    if (off > o.pathCoreMaxOff) {
+      useCore = true;
+      const alt = decode(bpm0);
+      if (alt.length >= 4) {
+        metricLevel = { offCore: off, bpmBefore: (60 * fps * (beatsF.length - 1)) / (beatsF[beatsF.length - 1] - beatsF[0]) };
+        beatsF = alt;
+      } else useCore = false;
+    }
+  }
+  // tramo lento a mitad de canción (fuera de la zona final): el camino admite hasta ≈ 0.6× el tempo global, así que
+  // también cabe la MITAD de una sección más rápida (92 → 115 BPM: 57). Si los contratiempos de ese tramo suenan como
+  // beats (misma evidencia y prior que la comprobación de octava) se decodifica otra vez sin ese nivel lento. Un tramo
+  // lento de verdad (cuerdas reales a 0.56×) tiene contratiempos flojos y no se toca
+  let section = null;
+  if (!hint && o.sectionCheck && !useCore && beatsF.length >= 16) {
+    const run = slowRun(beatsF, bpm0, fps, fLast - (o.endBeats * 60 * fps) / bpm0, o.sectionLo);
+    if (run && run.to - run.from + 1 >= o.sectionMinBeats) {
+      const seg = beatsF.slice(run.from, run.to + 1);
+      const ev = octaveEvidence(seg, salAt);
+      const bpmRun = (60 * fps * (seg.length - 1)) / (seg[seg.length - 1] - seg[0]);
+      const lp = (b) => logPrior(b, o.octavePriorCenter, o.octavePriorSigma);
+      const dbl = o.octaveEvidenceWeight * Math.log(Math.max(1e-3, ev.mid) / o.octaveDoubleThreshold) + lp(2 * bpmRun) - lp(bpmRun);
+      if (dbl > 0) {
+        coreOverride = { coreLo: o.sectionCoreLo, coreHi: o.pathHi };
+        const alt = decode(bpm0);
+        coreOverride = null;
+        if (alt.length > beatsF.length) {
+          section = { from: run.from, to: run.to, mid: ev.mid, bpm: bpmRun };
+          beatsF = alt;
+        }
+      }
+    }
+  }
   // sin pulso claro (pads, voz) el camino de tempo sólo seguiría ruido: rejilla estable al tempo global
   // (con un tempo indicado por el usuario, ese tempo exacto: el afinado de estimateTempo sería ruido)
   const lowEvidence = beatContrast(beatsF, salAt) < o.steadyBelowContrast;
@@ -528,10 +628,9 @@ export function trackBeats(features, opts = {}) {
     if (ev.n >= o.octaveMinBeats && beatContrast(beatsF, salAt) >= o.octaveMinContrast) {
       const lp = (b) => logPrior(b, o.octavePriorCenter, o.octavePriorSigma);
       const k = o.octaveEvidenceWeight;
-      const th = o.octaveThreshold;
       // log-odds a favor de cada alternativa frente a quedarse
-      const half = bpmNow / 2 >= minBpm ? k * Math.log(th / Math.max(1e-3, ev.parity)) + lp(bpmNow / 2) - lp(bpmNow) : -Infinity;
-      const dbl = bpmNow * 2 <= maxBpm ? k * Math.log(Math.max(1e-3, ev.mid) / th) + lp(bpmNow * 2) - lp(bpmNow) : -Infinity;
+      const half = bpmNow / 2 >= minBpm ? k * Math.log(o.octaveHalfThreshold / Math.max(1e-3, ev.parity)) + lp(bpmNow / 2) - lp(bpmNow) : -Infinity;
+      const dbl = bpmNow * 2 <= maxBpm ? k * Math.log(Math.max(1e-3, ev.mid) / o.octaveDoubleThreshold) + lp(bpmNow * 2) - lp(bpmNow) : -Infinity;
       const mult = half > 0 && half >= dbl ? 0.5 : dbl > 0 ? 2 : 1;
       if (mult !== 1) {
         const alt = decode(bpm0 * mult, lowEvidence);
@@ -553,11 +652,13 @@ export function trackBeats(features, opts = {}) {
   sal = sal.slice(s0);
 
   // extrapolación por la cola (acorde que resuena) mientras quede al menos medio beat de música y el nivel no haya caído
-  // más de tailDropDb respecto al golpe final (tras un corte seco sólo queda reverberación: no es tiempo musical)
-  const fEnd = Math.floor(musicEnd * fps) - f0;
+  // más de tailDropDb respecto al golpe final (tras un corte seco sólo queda reverberación: no es tiempo musical).
+  // Tampoco sobre los aplausos del final de un directo (findNoiseTail): tapan la cola y no son tiempo musical
+  const noise = findNoiseTail(features, endSearch);
+  const fEnd = Math.floor(Math.min(musicEnd, noise ? noise.coreStart : Infinity) * fps) - f0;
   let extrapolated = 0;
   if (beatsF.length >= 2) {
-    const rms = frameLevel(features, o.samples);
+    const rms = (k) => features.rms[k]; // RMS por trama sin componente continua (features.js)
     // nivel máximo en [g + skip, g + skip + sec] (tramas de ±23 ms: con skip = 50 ms no se mezcla lo anterior al beat)
     const rmsAfter = (g, sec, skip) => {
       let m = 0;
@@ -616,5 +717,5 @@ export function trackBeats(features, opts = {}) {
   const contrast = beatContrast(beatsF.slice(0, beatsF.length - extrapolated), salAt);
   const [c0, c1] = o.confidenceContrast;
   const confidence = Math.min(1, Math.max(0, Math.log(contrast / c0) / Math.log(c1 / c0)));
-  return { beats, bpm, strength, tempi, confidence, extrapolated, octave, contrast };
+  return { beats, bpm, strength, tempi, confidence, extrapolated, octave, metricLevel, section, contrast };
 }
