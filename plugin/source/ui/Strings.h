@@ -4,6 +4,7 @@
 // Constantes en UTF-8: usar T() para convertirlas a juce::String.
 #pragma once
 
+#include "PluginState.h"
 #include "ui/Format.h"
 
 #include <juce_core/juce_core.h>
@@ -142,6 +143,13 @@ constexpr const char* lowConfidence =
     "tiempos por compás o usa «Mover el 1».";
 constexpr const char* tempoOutOfRange = "Ese tempo queda fuera del rango que se puede detectar.";
 constexpr const char* hostNoInfo = "FL no informó el tempo: prueba «Detectar del audio».";
+constexpr const char* sourceMeter = "Compás original";
+constexpr const char* sourceMeterAuto = "Auto (de FL)";
+constexpr const char* sourceMeterTip =
+    "El compás en que está el audio tomado. «Auto» usa el de FL y, si ya pusiste FL en el compás nuevo, el de la "
+    "primera toma. Elige otro si la cuadrícula no coincide con la canción.";
+constexpr const char* meterFromFirstTake = " (compás original de la primera toma)";
+constexpr const char* meterChosenByHand = " (elegido a mano)";
 
 // ---- 2 · Recortar cada compás ----
 constexpr const char* trimTitle = "Recortar cada compás";
@@ -216,13 +224,23 @@ inline juce::String clause (const juce::String& s)
 }
 } // namespace detail
 
-/** "FL: 120 BPM · 4/4" (cuadrícula de FL). */
-inline juce::String hostInfo (double bpm, int num, int den)
+/**
+ * "FL: 120 BPM · 4/4" (cuadrícula de FL), con de dónde sale el compás si no es el que informó FL:
+ * "FL: 120 BPM · 4/4 (compás original de la primera toma)" / "… (elegido a mano)".
+ */
+inline juce::String hostInfo (double bpm, int num, int den,
+                              djec::plugin::MeterOrigin origin = djec::plugin::MeterOrigin::Host)
 {
     juce::String s ("FL: ");
     s << (bpm > 0 ? fmt::number (bpm, 2) + " BPM" : T ("tempo desconocido"));
     if (num > 0 && den > 0)
+    {
         s << T (" · ") << num << "/" << den;
+        if (origin == djec::plugin::MeterOrigin::FirstTake)
+            s << T (str::meterFromFirstTake);
+        else if (origin == djec::plugin::MeterOrigin::Manual)
+            s << T (str::meterChosenByHand);
+    }
     return s;
 }
 

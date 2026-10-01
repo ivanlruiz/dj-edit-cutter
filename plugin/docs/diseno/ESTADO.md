@@ -15,9 +15,13 @@ Hecho (ver SPEC-PLUGIN.md: la sección "USER DECISION v2" al principio manda sob
 - CI (`.github/workflows/plugin.yml`): Linux y Windows (MSVC), artefacto con el VST3 y release con un tag
   `plugin-vX.Y.Z`.
 - Guía para el usuario: `plugin/README.md`.
+- Ajustes después de la primera versión: compás original recordado (y «Compás original» a mano) para las tomas
+  posteriores con FL ya en el compás nuevo; «Quitar compases del final» cuenta desde el golpe final también con la
+  cuadrícula de FL (analyzeBounds + applyMusicBounds); tomas en `%LOCALAPPDATA%\DJ Edit Cutter\Tomas` con limpieza
+  (3 GB / 60 días, nunca un archivo en uso) y migración desde `%APPDATA%`; tolerancia de continuidad de la posición
+  del host (max(2 muestras, 0,5 ms)); hilos de fondo que en reposo se despiertan cada 25 ms.
 
 Pendiente:
 - Primera ejecución del CI en Windows y prueba real en FL Studio: continuidad de la posición del host, Smart disable,
   PDC, arrastrar al Playlist, escalado de la interfaz.
-- Política para borrar tomas viejas (`%APPDATA%\DJ Edit Cutter\Tomas`).
 - M4A/AAC en Windows (haría falta un lector de Media Foundation).

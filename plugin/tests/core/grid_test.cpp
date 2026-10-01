@@ -5,6 +5,7 @@
 
 #include "djec/bars.h"
 #include "djec/edit_plan.h"
+#include "djec/fade.h"
 #include "djec/grid.h"
 #include "djec/meter.h"
 
@@ -364,4 +365,53 @@ TEST_CASE("sin ppq ni inicio de compás del host, o sin nada")
     CHECK(buildEditPlan(empty, 4, EditSettings{}).meter.error == kMeterMsgNoBeats);
     CHECK(gridFromHost(CaptureInfo{}).beats.empty());
 }
+}
+
+TEST_CASE("applyMusicBounds: el silencio o la resonancia del final no cuentan; si la música sigue, cuentan todos")
+{
+    // 12 compases de 4/4 a 120 BPM (24 s) y la toma dura 29 s
+    Sim s;
+    s.numSamples = 29 * 44100;
+    const AnalysisResult raw = gridFromHost(simulate(s));
+    CHECK(raw.lastOnset == doctest::Approx(29.0));
+    EditSettings one;
+    one.removeEnd = true;
+    one.barsToRemove = 1;
+
+    // la música termina a los 24 s con el último golpe a los 23,75 s: cuenta desde el compás 12
+    AnalysisResult g = raw;
+    applyMusicBounds(g, 0.0, 24.0, 23.75);
+    CHECK(g.musicEnd == doctest::Approx(24.0));
+    CHECK(g.lastOnset == doctest::Approx(23.75));
+    CHECK(findLastBarIndex(g) == 11);
+    CHECK(buildEditPlan(g, 4, EditSettings{}).meter.barsChanged == 11);
+    CHECK(buildEditPlan(g, 4, one).cutTime == doctest::Approx(22.0 - kCutPrerollSec));
+    CHECK(buildEditPlan(raw, 4, one).cutTime == doctest::Approx(28.0 - kCutPrerollSec));   // antes: un compás vacío
+
+    // la música suena hasta el final de la toma y hay un golpe en el último beat: la toma cortó la canción
+    AnalysisResult c = raw;
+    applyMusicBounds(c, 0.0, 28.99, 28.6);
+    CHECK(c.lastOnset == doctest::Approx(29.0));
+    CHECK(c.musicEnd == doctest::Approx(29.0));
+    // …pero si el último golpe es de hace más de un beat, es una resonancia (cuenta desde el golpe)
+    AnalysisResult r = raw;
+    applyMusicBounds(r, 0.0, 28.99, 26.0);
+    CHECK(r.lastOnset == doctest::Approx(26.0));
+    CHECK(findLastBarIndex(r) == 13);
+    // y si la música terminó antes (silencio corto al final), también
+    AnalysisResult q = raw;
+    applyMusicBounds(q, 0.0, 28.8, 28.6);
+    CHECK(q.lastOnset == doctest::Approx(28.6));
+
+    // sin música (silencio) o valores no finitos: no cambia nada; fuera de rango: se limita
+    AnalysisResult z = raw;
+    applyMusicBounds(z, 0.0, 0.0, 0.0);
+    CHECK(z.lastOnset == raw.lastOnset);
+    applyMusicBounds(z, 0.0, std::nan(""), 3.0);
+    CHECK(z.lastOnset == raw.lastOnset);
+    AnalysisResult o = raw;
+    applyMusicBounds(o, -1.0, 50.0, 40.0);
+    CHECK(o.musicStart == 0);
+    CHECK(o.musicEnd == doctest::Approx(29.0));
+    CHECK(o.lastOnset == doctest::Approx(29.0));
 }

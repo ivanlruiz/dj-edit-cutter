@@ -76,4 +76,18 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
+/** Límites de la música y golpe final (segundos sobre el audio analizado), sin tempo, beats ni compases. */
+struct MusicBoundsResult
+{
+    double duration = 0, musicStart = 0, musicEnd = 0, lastOnset = 0;
+};
+
+/**
+ * Lo mismo que analyze() deja en duration, musicStart, musicEnd y lastOnset (findMusicBounds y findLastOnset de la web,
+ * sobre las mismas muestras preparadas y las mismas características), sin calcular tempo, beats ni compases: para la
+ * cuadrícula de FL, que no detecta nada pero necesita saber dónde termina la música (djec::applyMusicBounds en
+ * djec/grid.h). mono y sampleRate como en analyze() (normalmente toAnalysisMono, 22050 Hz). Mismos errores que analyze().
+ */
+MusicBoundsResult analyzeBounds(const float* mono, std::size_t n, double sampleRate);
+
 } // namespace djec

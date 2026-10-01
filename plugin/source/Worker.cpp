@@ -27,6 +27,9 @@ constexpr double kAlignRetrySec = 1.0;      // después, cada segundo más
 constexpr double kAlignGiveUpSec = 8.0;     // a los ~8 s sin encontrarlo: aviso + «El archivo empieza en el compás 1»
 constexpr std::size_t kMaxNotices = 8;
 constexpr double kTempoMatchLo = 0.92, kTempoMatchHi = 1.08;   // TEMPO_MATCH de main.js
+constexpr int kActiveWaitMs = 5;     // con el transporte en marcha (o trabajo reciente): mira la cola del audio cada 5 ms
+constexpr int kIdleWaitMs = 25;      // en reposo, cada 25 ms (las órdenes de la interfaz lo despiertan al instante)
+constexpr juce::int64 kActiveHoldMs = 1000;   // sigue mirando seguido un rato después de la última actividad
 
 juce::String u8(const char* s)
 {
@@ -124,6 +127,64 @@ int barNumberAt(const std::vector<AnchorEntry>& anchors, std::int64_t h, double 
     return static_cast<int>(std::max(1.0, barNum));
 }
 
+// ---- compás de las anclas (cuadrícula de FL) ----
+int meterNum(int n)
+{
+    return n >= 1 && n <= 64 ? n : 4;   // como gridFromHost
+}
+int meterDen(int d)
+{
+    return (d == 2 || d == 4 || d == 8 || d == 16) ? d : 4;
+}
+
+/** ppq de un ancla (NaN si no hay ppq ni tempo), como gridFromHost. */
+double anchorPpq(const HostBlockInfo& i, double sr)
+{
+    if (i.ppqValid && std::isfinite(i.ppq))
+        return i.ppq;
+    if (i.bpm > 0 && sr > 0)
+        return static_cast<double>(i.hostSample) / sr * i.bpm / 60;
+    return std::numeric_limits<double>::quiet_NaN();
+}
+
+/** ppq de un "1" del compás del ancla (el inicio de compás de FL o, sin él, compases desde ppq 0). */
+double anchorBarStart(const HostBlockInfo& i, double sr)
+{
+    const double barLen = meterNum(i.tsNum) * 4.0 / meterDen(i.tsDen);
+    if (i.barValid && std::isfinite(i.lastBarStartPpq))
+        return i.lastBarStartPpq;
+    const double ppq = anchorPpq(i, sr);
+    return std::isfinite(ppq) ? std::floor(ppq / barLen + 1e-9) * barLen : 0.0;
+}
+
+/** Fase del compás: ppq de un "1" módulo el largo del compás, en [0, largo). */
+double barPhase(double barStartPpq, int num, int den)
+{
+    const double barLen = num * 4.0 / den;
+    double ph = std::fmod(barStartPpq, barLen);
+    if (ph < 0)
+        ph += barLen;
+    if (ph >= barLen - 1e-9)
+        ph = 0;
+    return ph;
+}
+
+/** El ancla pasa a decir num/den con los "1" en phase + k · largo del compás. */
+void setAnchorMeter(HostBlockInfo& i, int num, int den, double phase, double sr)
+{
+    const double barLen = num * 4.0 / den;
+    const double ppq = anchorPpq(i, sr);
+    i.tsNum = num;
+    i.tsDen = den;
+    if (std::isfinite(ppq))
+    {
+        i.lastBarStartPpq = phase + std::floor((ppq - phase) / barLen + 1e-9) * barLen;
+        i.barValid = true;
+    }
+    else
+        i.barValid = false;
+}
+
 std::vector<TempoPoint> tempoMap(const std::vector<AnchorEntry>& anchors, std::int64_t A, double sr)
 {
     std::vector<TempoPoint> pts;
@@ -182,6 +243,12 @@ struct Worker::Model
     // toma guardada en disco
     juce::File wav;
     std::uint64_t hash = 0;
+    // compás de la cuadrícula de FL
+    bool meterFromMemory = false;       // las anclas dicen el compás recordado (FL estaba en el compás nuevo)
+    int takeHostNum = 0, takeHostDen = 0;   // lo que dijo FL durante la toma
+    // límites de la música (analyzeBounds o los de la detección): para la cuadrícula de FL
+    bool boundsValid = false;
+    djec::MusicBoundsResult bounds;
     // análisis
     djec::Analyzer analyzer;
     bool analyzed = false;
@@ -216,6 +283,11 @@ Worker::Worker(Hub& hub) : hub_(hub), m_(std::make_unique<Model>())
 Worker::~Worker()
 {
     stop();
+    // (sin hilo: ya se puede tocar el modelo) el WAV deja de estar en uso por esta instancia
+    takefiles::release(m_->wav);
+    const std::lock_guard<std::mutex> lock(stateMutex_);
+    takefiles::release(pendingRestoreFile_);
+    pendingRestoreFile_ = juce::File();
 }
 
 void Worker::start()
@@ -226,6 +298,8 @@ void Worker::start()
         const std::lock_guard<std::mutex> lock(jobsMutex_);
         stop_ = false;
     }
+    startedMs_ = juce::Time::currentTimeMillis();
+    lastActiveMs_ = startedMs_;
     thread_ = std::thread([this] { run(); });
 }
 
@@ -250,14 +324,28 @@ void Worker::post(std::function<void()> job)
     jobsCv_.notify_one();
 }
 
+bool Worker::activeNow()
+{
+    const juce::int64 now = juce::Time::currentTimeMillis();
+    const LiveAtomics& L = hub_.live;
+    if (L.playing.load(std::memory_order_relaxed) || L.recKind.load(std::memory_order_relaxed) >= 0
+        || hub_.events.sizeApprox() > 0 || rebuildPending_.load() || hub_.align.listening.load(std::memory_order_relaxed)
+        || !pendingCommands_.empty())
+        lastActiveMs_ = now;
+    return now - lastActiveMs_ < kActiveHoldMs;
+}
+
 void Worker::run()
 {
     for (;;)
     {
         std::function<void()> job;
         {
+            const int waitMs = activeNow() ? kActiveWaitMs : kIdleWaitMs;
             std::unique_lock<std::mutex> lock(jobsMutex_);
-            jobsCv_.wait_for(lock, std::chrono::milliseconds(5), [this] { return stop_ || !jobs_.empty(); });
+            // (rebuildPending_: los ajustes lo marcan y avisan sin encolar un trabajo)
+            jobsCv_.wait_for(lock, std::chrono::milliseconds(waitMs),
+                             [this] { return stop_ || !jobs_.empty() || rebuildPending_.load(); });
             if (stop_)
                 return;
             if (!jobs_.empty())
@@ -268,11 +356,14 @@ void Worker::run()
             // ocupado mientras haya algo que hacer en esta vuelta (lo mira waitIdle)
             busyJob_.store(job != nullptr || hub_.events.sizeApprox() > 0 || rebuildPending_.load());
         }
+        wakeups_.fetch_add(1, std::memory_order_relaxed);
         deleteRetired();
         flushCommands();
         drainAudioEvents();
+        hub_.pool.wake();   // si el audio gastó trozos (o se devolvieron), que el repositorio los reponga ya
         if (job)
         {
+            lastActiveMs_ = juce::Time::currentTimeMillis();
             try
             {
                 job();
@@ -286,6 +377,7 @@ void Worker::run()
         if (rebuildPending_.exchange(false))
             rebuild();
         tryAlign();
+        maintainTakeFiles();
         deleteRetired();
         flushCommands();
         busyJob_.store(false);
@@ -476,6 +568,8 @@ void Worker::consumeRecording(const AudioEvent& e)
     }
     if (!m.take || m.source != TakeSource::Playback || !m.placed || m.take->id != id)
         return;
+    // lo agregado puede venir con FL ya en el compás nuevo (el que pide el plugin): mismo compás que la toma
+    normalizeAnchors(anchors, m.take->sampleRate, false);
     const auto& old = m.take->channels;
     const int outCh = std::max(nCh, m.take->numChannels());
     auto chan = [](const std::vector<std::vector<float>>& v, int k) -> const std::vector<float>& {
@@ -545,6 +639,7 @@ void Worker::consumeRecording(const AudioEvent& e)
     m.anchors = std::move(mergedAnchors);
     m.analyzed = false;
     m.analyzer.reset();
+    m.boundsValid = false;
     m.peaks = computePeaks(m.take->channels, m.take->sampleRate);
     rebuild();
     saveTakeWav();
@@ -568,6 +663,7 @@ void Worker::newTakeFromAudio(std::vector<std::vector<float>> channels, std::uin
     m.source = TakeSource::Playback;
     m.A = hostStart;
     m.placed = true;
+    normalizeAnchors(anchors, m.take->sampleRate, true);
     m.anchors = std::move(anchors);
     // (los avisos de "lo vuelvo a tomar" se quedan: explican por qué hay una toma nueva)
     for (const char* k : {"take-missing", "take-short", "file-found", "file-loaded", "file-not-found", "file-silent",
@@ -603,6 +699,10 @@ void Worker::clearModel(bool keepFile)
     m.analyzer.reset();
     m.analyzed = false;
     m.detect = djec::AnalysisResult{};
+    m.boundsValid = false;
+    m.bounds = djec::MusicBoundsResult{};
+    m.meterFromMemory = false;
+    m.takeHostNum = m.takeHostDen = 0;
     m.forcedTimes.clear();
     m.grid = djec::AnalysisResult{};
     m.meta = djec::HostGridMeta{};
@@ -627,8 +727,20 @@ void Worker::clearModel(bool keepFile)
         persist_.anchors.clear();
         persist_.align = AlignState::None;
         persist_.fileStartBar = 0;
+        persist_.meterFromMemory = false;
+        persist_.takeHostNum = persist_.takeHostDen = 0;
         export_ = ExportData{};
     }
+}
+
+void Worker::setTakeWav(const juce::File& file)
+{
+    Model& m = *m_;
+    if (m.wav == file)
+        return;
+    takefiles::acquire(file);
+    takefiles::release(m.wav);
+    m.wav = file;
 }
 
 void Worker::forgetTakeFile()
@@ -640,11 +752,66 @@ void Worker::forgetTakeFile()
         referenced = takeFileReferenced_;
         takeFileReferenced_ = false;
     }
-    // un WAV de toma que nunca se guardó en un proyecto no sirve para nada más: se borra
-    if (m.wav != juce::File() && !referenced && m.wav.existsAsFile())
-        m.wav.deleteFile();
-    m.wav = juce::File();
+    const juce::File old = m.wav;
+    setTakeWav(juce::File());
+    // un WAV de toma que nunca se guardó en un proyecto no sirve para nada más: se borra (si nadie más lo usa)
+    if (old != juce::File() && !referenced && !takefiles::isInUse(old) && old.existsAsFile())
+        old.deleteFile();
     m.hash = 0;
+}
+
+void Worker::persistTakeMeter()
+{
+    const Model& m = *m_;
+    const std::lock_guard<std::mutex> lock(stateMutex_);
+    persist_.meterFromMemory = m.meterFromMemory;
+    persist_.takeHostNum = m.takeHostNum;
+    persist_.takeHostDen = m.takeHostDen;
+}
+
+void Worker::setCleanupPolicy(const takefiles::Policy& policy)
+{
+    const std::lock_guard<std::mutex> lock(stateMutex_);
+    cleanupPolicy_ = policy;
+}
+
+void Worker::runCleanup()
+{
+    takefiles::Policy policy;
+    {
+        const std::lock_guard<std::mutex> lock(stateMutex_);
+        policy = cleanupPolicy_;
+    }
+    const juce::File keep = m_->wav;
+    const juce::Time now = juce::Time::getCurrentTime();
+    takefiles::cleanup(paths::takesDir(), policy, now, keep);
+    const juce::File legacy = paths::legacyTakesDir();
+    if (legacy != juce::File() && legacy.isDirectory())
+        takefiles::cleanup(legacy, policy, now, keep);
+}
+
+void Worker::maintainTakeFiles()
+{
+    takefiles::Policy policy;
+    {
+        const std::lock_guard<std::mutex> lock(stateMutex_);
+        policy = cleanupPolicy_;
+    }
+    const juce::int64 now = juce::Time::currentTimeMillis();
+    // otro proceso de FL que limpie la carpeta ve que este WAV está en uso (modificado hace poco)
+    const Model& m = *m_;
+    if (m.wav != juce::File()
+        && static_cast<double>(now - lastTouchMs_) >= policy.touchIntervalMinutes * 60.0 * 1000.0)
+    {
+        takefiles::touch(m.wav);
+        lastTouchMs_ = now;
+    }
+    // al arrancar, pero cuando FL ya abrió el proyecto (todas las instancias cargaron su toma y la marcaron en uso)
+    if (!startupCleanupDone_ && now - startedMs_ >= policy.startupDelayMs)
+    {
+        startupCleanupDone_ = true;
+        runCleanup();
+    }
 }
 
 void Worker::saveTakeWav()
@@ -666,6 +833,8 @@ void Worker::saveTakeWav()
     }
     const std::uint64_t hash = wav::hashAudio(ptrs.data(), m.take->numChannels(), m.take->numSamples);
     const juce::File old = m.wav;
+    setTakeWav(file);
+    lastTouchMs_ = juce::Time::currentTimeMillis();
     bool oldReferenced;
     {
         const std::lock_guard<std::mutex> lock(stateMutex_);
@@ -683,12 +852,108 @@ void Worker::saveTakeWav()
         persist_.anchors = m.anchors;
         persist_.align = AlignState::None;
         persist_.fileStartBar = 0;
+        persist_.meterFromMemory = m.meterFromMemory;
+        persist_.takeHostNum = m.takeHostNum;
+        persist_.takeHostDen = m.takeHostDen;
     }
-    m.wav = file;
     m.hash = hash;
-    if (old != juce::File() && old != file && !oldReferenced && old.existsAsFile())
+    if (old != juce::File() && old != file && !oldReferenced && !takefiles::isInUse(old) && old.existsAsFile())
         old.deleteFile();
     publishView();
+    // cada toma nueva ocupa disco: se aplica la política de limpieza (nunca toca este archivo ni los que estén en uso)
+    runCleanup();
+}
+
+// ---- compás original y límites de la música (cuadrícula de FL) ---------------------------------------------------
+
+// El plugin pide poner el compás de FL en el compás NUEVO (p. ej. 7/8). Una toma posterior (cambio en el canal, cambio
+// de tempo, «Volver a tomar el audio», agregar delante/detrás) leería ese compás de FL y armaría una cuadrícula de 7/8
+// sobre un audio que sigue en 4/4. Regla (con «Compás original» en Auto): se recuerda el compás de la primera toma; en
+// las siguientes, las anclas en las que FL dice el compás destino de «Recortar cada compás» (calculado con el compás
+// recordado) y no el recordado pasan al recordado (con su fase: los "1" donde estaban). Si FL dice otro compás, ese pasa
+// a ser el recordado (otra canción, o el usuario cambió el compás del proyecto a propósito). Con un compás elegido a
+// mano no se recuerda ni se cambia nada aquí: lo aplica rebuild().
+void Worker::normalizeAnchors(std::vector<AnchorEntry>& anchors, double sr, bool newTake)
+{
+    Model& m = *m_;
+    if (anchors.empty())
+        return;
+    const HostBlockInfo& first = anchors.front().info;
+    const int hNum = meterNum(first.tsNum), hDen = meterDen(first.tsDen);
+    if (newTake)
+    {
+        m.takeHostNum = hNum;
+        m.takeHostDen = hDen;
+        m.meterFromMemory = false;
+    }
+    djec::EditSettings settings;
+    int remNum, remDen, manualNum;
+    double remPhase;
+    {
+        const std::lock_guard<std::mutex> lock(stateMutex_);
+        settings = persist_.settings;
+        remNum = persist_.rememberedNum;
+        remDen = persist_.rememberedDen;
+        remPhase = persist_.rememberedPhasePpq;
+        manualNum = persist_.sourceMeterNum;
+    }
+    if (manualNum > 0)
+        return;
+    auto remember = [&](int num, int den, const HostBlockInfo& i) {
+        const std::lock_guard<std::mutex> lock(stateMutex_);
+        persist_.rememberedNum = num;
+        persist_.rememberedDen = den;
+        persist_.rememberedPhasePpq = barPhase(anchorBarStart(i, sr), num, den);
+    };
+    if (remNum <= 0 || remDen <= 0)
+    {
+        if (newTake)
+            remember(hNum, hDen, first);
+        return;
+    }
+    const djec::TargetMeter target = djec::targetMeter(settings.amount, settings.otherNum, settings.otherDen, remNum, remDen);
+    bool remapped = false;
+    if (target.num > 0 && target.den > 0 && !(target.num == remNum && target.den == remDen))
+        for (AnchorEntry& a : anchors)
+            if (meterNum(a.info.tsNum) == target.num && meterDen(a.info.tsDen) == target.den)
+            {
+                setAnchorMeter(a.info, remNum, remDen, remPhase, sr);
+                remapped = true;
+            }
+    if (remapped)
+        m.meterFromMemory = true;
+    else if (newTake && (hNum != remNum || hDen != remDen))
+        remember(hNum, hDen, first);
+}
+
+void Worker::ensureBounds()
+{
+    Model& m = *m_;
+    if (m.boundsValid || !m.take)
+        return;
+    if (m.analyzed)
+    {
+        // «Detectar del audio» ya los calculó (mismo audio, mismas funciones)
+        m.bounds.duration = m.detect.duration;
+        m.bounds.musicStart = m.detect.musicStart;
+        m.bounds.musicEnd = m.detect.musicEnd;
+        m.bounds.lastOnset = m.detect.lastOnset;
+        m.boundsValid = true;
+        return;
+    }
+    try
+    {
+        const std::vector<const float*> ptrs = m.take->pointers();
+        const std::vector<float> mono = djec::toAnalysisMono(ptrs.data(), m.take->numChannels(),
+                                                             static_cast<std::size_t>(m.take->numSamples),
+                                                             m.take->sampleRate);
+        m.bounds = djec::analyzeBounds(mono.data(), mono.size(), djec::kAnalysisSampleRate);
+        m.boundsValid = true;
+    }
+    catch (const std::exception&)
+    {
+        m.boundsValid = false;   // sin límites: cuentan todos los compases (como antes)
+    }
 }
 
 // ---- cuadrícula, plan, render ---------------------------------------------------------------------------------
@@ -720,6 +985,12 @@ bool Worker::runAnalysis()
                                                        m.take->sampleRate);
         djec::AnalysisResult r = m.analyzer.analyze(mono.data(), mono.size(), djec::kAnalysisSampleRate, {}, progress);
         std::vector<float>().swap(mono);
+        // los límites de la música son los mismos que usa la cuadrícula de FL (analyzeBounds): no se recalculan
+        m.bounds.duration = r.duration;
+        m.bounds.musicStart = r.musicStart;
+        m.bounds.musicEnd = r.musicEnd;
+        m.bounds.lastOnset = r.lastOnset;
+        m.boundsValid = true;
         // correcciones guardadas (al cargar un proyecto)
         if (d.bpmHint > 0)
             r = m.analyzer.retrack(d.bpmHint, d.strict, progress);
@@ -768,12 +1039,14 @@ void Worker::rebuild()
     }
     djec::EditSettings settings;
     GridMode mode;
-    int barOffset;
+    int barOffset, manualNum, manualDen;
     {
         const std::lock_guard<std::mutex> lock(stateMutex_);
         settings = persist_.settings;
         mode = persist_.gridMode;
         barOffset = persist_.barOffsetBeats;
+        manualNum = persist_.sourceMeterNum;
+        manualDen = persist_.sourceMeterDen;
     }
     const TakeAudio& t = *m.take;
     const double sr = t.sampleRate;
@@ -803,10 +1076,22 @@ void Worker::rebuild()
         cap.sampleRate = sr;
         cap.hostStartSample = m.A;
         cap.numSamples = static_cast<std::size_t>(t.numSamples);
+        // «Compás original» elegido a mano: ese compás, con un "1" donde empezaba el compás de la primera ancla
+        const bool manual = manualNum > 0 && manualDen > 0 && !m.anchors.empty();
+        const double ref = manual ? anchorBarStart(m.anchors.front().info, sr) : 0.0;
         for (const AnchorEntry& a : m.anchors)
-            cap.blocks.emplace_back(a.offset, a.info);
+        {
+            HostBlockInfo info = a.info;
+            if (manual)
+                setAnchorMeter(info, manualNum, manualDen, barPhase(ref, manualNum, manualDen), sr);
+            cap.blocks.emplace_back(a.offset, info);
+        }
         m.grid = djec::gridFromHost(cap, barOffset, &m.meta);
         m.sourceDen = m.meta.tsDen;
+        // el silencio o la resonancia del final no cuentan como compases (como la web; ver applyMusicBounds)
+        ensureBounds();
+        if (m.boundsValid)
+            djec::applyMusicBounds(m.grid, m.bounds.musicStart, m.bounds.musicEnd, m.bounds.lastOnset);
         // la cuadrícula de FL es exacta: sin imán (el resultado es el mismo en cada pasada)
     }
     else
@@ -932,6 +1217,10 @@ void Worker::publishView()
         ps.barOffsetBeats = persist_.barOffsetBeats;
         ps.detect = persist_.detect;
         ps.trackName = persist_.trackName;
+        ps.sourceMeterNum = persist_.sourceMeterNum;
+        ps.sourceMeterDen = persist_.sourceMeterDen;
+        ps.rememberedNum = persist_.rememberedNum;
+        ps.rememberedDen = persist_.rememberedDen;
     }
     if (m.take)
     {
@@ -969,6 +1258,15 @@ void Worker::publishView()
         v->lastBarIndex = djec::findLastBarIndex(m.grid);
     }
     v->barOffsetBeats = ps.barOffsetBeats;
+    v->sourceMeterNum = ps.sourceMeterNum;
+    v->sourceMeterDen = ps.sourceMeterDen;
+    v->rememberedNum = ps.rememberedNum;
+    v->rememberedDen = ps.rememberedDen;
+    v->takeHostNum = m.takeHostNum;
+    v->takeHostDen = m.takeHostDen;
+    v->meterOrigin = ps.sourceMeterNum > 0 ? MeterOrigin::Manual
+                     : m.meterFromMemory   ? MeterOrigin::FirstTake
+                                           : MeterOrigin::Host;
     v->detect = ps.detect;
     if (ps.gridMode == GridMode::Host)
     {
@@ -1098,7 +1396,7 @@ void Worker::doLoadFile(const juce::File& file, bool restoring, const PersistedS
                            std::llround(rs->sampleRate) == std::llround(sr) && rs->numSamples == m.take->numSamples;
     if (keepPlace)
     {
-        placeFile(rs->hostStart, rs->anchors, rs->align, 1.0);
+        placeFile(rs->hostStart, rs->anchors, rs->align, 1.0, rs);
         clearNotice("file-found");   // al abrir el proyecto no hace falta avisar
         publishView();
         return;
@@ -1208,7 +1506,8 @@ void Worker::tryAlign()
     }
 }
 
-void Worker::placeFile(std::int64_t A, const std::vector<AnchorEntry>& anchorsRel, AlignState how, double confidence)
+void Worker::placeFile(std::int64_t A, const std::vector<AnchorEntry>& anchorsRel, AlignState how, double confidence,
+                       const PersistedState* restored)
 {
     Model& m = *m_;
     if (!m.take)
@@ -1221,8 +1520,21 @@ void Worker::placeFile(std::int64_t A, const std::vector<AnchorEntry>& anchorsRe
               [](const AnchorEntry& x, const AnchorEntry& y) { return x.offset < y.offset; });
     m.align = how;
     m.alignConfidence = confidence;
-    // compás de FL donde empieza (con la posición del host anotada; las anclas guardan la muestra del host)
-    m.fileStartBar = barNumberAt(m.anchors, A, sr);
+    if (restored != nullptr)
+    {
+        // estado guardado: las anclas ya tienen el compás que se usó y el compás de inicio ya se calculó
+        m.fileStartBar = restored->fileStartBar > 0 ? restored->fileStartBar : barNumberAt(m.anchors, A, sr);
+        m.meterFromMemory = restored->meterFromMemory;
+        m.takeHostNum = restored->takeHostNum;
+        m.takeHostDen = restored->takeHostDen;
+    }
+    else
+    {
+        // compás de FL donde empieza (con lo que informó FL: es el número que se ve en su línea de tiempo)
+        m.fileStartBar = barNumberAt(m.anchors, A, sr);
+        normalizeAnchors(m.anchors, sr, true);
+    }
+    persistTakeMeter();
     clearNotice("file-not-found");
     clearNotice("file-loaded");
     clearNotice("file-silent");
@@ -1264,6 +1576,17 @@ void Worker::doRestore(const PersistedState& ps)
         return;
     }
     m.hasPendingRestore = false;
+    // el WAV del estado estuvo marcado en uso desde restore() hasta ahora (que se carga o se descarta)
+    struct ReleasePending
+    {
+        Worker* w;
+        ~ReleasePending()
+        {
+            const std::lock_guard<std::mutex> lock(w->stateMutex_);
+            takefiles::release(w->pendingRestoreFile_);
+            w->pendingRestoreFile_ = juce::File();
+        }
+    } releasePending{this};
     clearModel(false);
     if (ps.source == TakeSource::None)
     {
@@ -1299,8 +1622,17 @@ void Worker::doRestore(const PersistedState& ps)
         fail(u8("Cambió la frecuencia de muestreo del proyecto: vuelvo a tomar el audio en el próximo Play."));
         return;
     }
+    // la ruta guardada; si no está, el mismo archivo en Tomas (otra instancia ya lo migró) o en la carpeta de antes
+    juce::File takeFile = ps.takeFile;
+    if (!takeFile.existsAsFile())
+        for (const juce::File& dir : {paths::takesDir(), paths::legacyTakesDir()})
+            if (dir != juce::File() && dir.getChildFile(ps.takeFile.getFileName()).existsAsFile())
+            {
+                takeFile = dir.getChildFile(ps.takeFile.getFileName());
+                break;
+            }
     wav::Audio audio;
-    const juce::Result r = wav::read(ps.takeFile, audio);
+    const juce::Result r = wav::read(takeFile, audio);
     bool ok = r.wasOk() && audio.frames() == ps.numSamples && !audio.channels.empty();
     if (ok && ps.hash != 0)
     {
@@ -1314,6 +1646,21 @@ void Worker::doRestore(const PersistedState& ps)
         fail(u8("No encontré el audio tomado de esta sesión: dale Play para volver a tomarlo."));
         return;
     }
+    // migración: una toma de la carpeta de antes (%APPDATA%, móvil) pasa a Tomas (%LOCALAPPDATA%); si no se puede
+    // mover (otro proceso la tiene abierta…), se sigue usando donde está
+    {
+        const juce::File legacy = paths::legacyTakesDir();
+        if (legacy != juce::File() && takeFile.getParentDirectory() == legacy)
+        {
+            const juce::File dir = paths::takesDir();
+            const juce::File dest = dir.getChildFile(takeFile.getFileName());
+            if (!dest.exists() && dir.createDirectory().wasOk() && takeFile.moveFileTo(dest))
+                takeFile = dest;
+        }
+    }
+    // se usa ahora: la fecha de modificación cuenta para la limpieza (las tomas sin usar en 60 días se borran)
+    takefiles::touch(takeFile);
+    lastTouchMs_ = juce::Time::currentTimeMillis();
     auto t = std::make_shared<TakeAudio>();
     t->id = hub_.nextTakeId.fetch_add(1);
     t->sampleRate = sr;
@@ -1324,14 +1671,17 @@ void Worker::doRestore(const PersistedState& ps)
     m.A = ps.hostStart;
     m.placed = true;
     m.anchors = ps.anchors;
-    m.wav = ps.takeFile;
+    m.meterFromMemory = ps.meterFromMemory;
+    m.takeHostNum = ps.takeHostNum;
+    m.takeHostDen = ps.takeHostDen;
+    setTakeWav(takeFile);
     m.hash = ps.hash;
     m.peaks = computePeaks(m.take->channels, sr);
     {
         const std::lock_guard<std::mutex> lock(stateMutex_);
-        takeFileReferenced_ = true;   // viene de un proyecto guardado: nunca se borra solo
+        takeFileReferenced_ = true;   // viene de un proyecto guardado: no se borra al cambiar de toma
         persist_.source = TakeSource::Playback;
-        persist_.takeFile = ps.takeFile;
+        persist_.takeFile = takeFile;
         persist_.fileSize = ps.fileSize;
         persist_.hash = ps.hash;
         persist_.sampleRate = sr;
@@ -1339,6 +1689,17 @@ void Worker::doRestore(const PersistedState& ps)
         persist_.numSamples = m.take->numSamples;
         persist_.numChannels = m.take->numChannels();
         persist_.anchors = ps.anchors;
+        persist_.meterFromMemory = ps.meterFromMemory;
+        persist_.takeHostNum = ps.takeHostNum;
+        persist_.takeHostDen = ps.takeHostDen;
+        // estados de antes de recordar el compás original: el de la toma (FL todavía no estaba en el compás nuevo)
+        if (persist_.rememberedNum <= 0 && !ps.anchors.empty())
+        {
+            const HostBlockInfo& i = ps.anchors.front().info;
+            persist_.rememberedNum = meterNum(i.tsNum);
+            persist_.rememberedDen = meterDen(i.tsDen);
+            persist_.rememberedPhasePpq = barPhase(anchorBarStart(i, sr), persist_.rememberedNum, persist_.rememberedDen);
+        }
     }
     ++epoch_;
     AudioCommand c;
@@ -1525,6 +1886,18 @@ void Worker::setTrackName(const juce::String& name)
         if (persist_.trackName == name)
             return;
         persist_.trackName = name;
+    }
+    rebuildPending_ = true;
+    jobsCv_.notify_one();
+}
+
+void Worker::setSourceMeter(int num, int den)
+{
+    const bool valid = num >= 1 && num <= 32 && (den == 2 || den == 4 || den == 8 || den == 16);
+    {
+        const std::lock_guard<std::mutex> lock(stateMutex_);
+        persist_.sourceMeterNum = valid ? num : 0;
+        persist_.sourceMeterDen = valid ? den : 0;
     }
     rebuildPending_ = true;
     jobsCv_.notify_one();
@@ -1734,6 +2107,19 @@ void Worker::restore(const PersistedState& state)
         persist_.listenOriginal = state.listenOriginal;
         if (state.trackName.isNotEmpty())
             persist_.trackName = state.trackName;
+        persist_.sourceMeterNum = state.sourceMeterNum;
+        persist_.sourceMeterDen = state.sourceMeterDen;
+        persist_.rememberedNum = state.rememberedNum;
+        persist_.rememberedDen = state.rememberedDen;
+        persist_.rememberedPhasePpq = state.rememberedPhasePpq;
+        // hasta que se cargue, el WAV de la toma está en uso (la limpieza no lo toca)
+        const juce::File f = state.source == TakeSource::Playback ? state.takeFile : juce::File();
+        if (f != pendingRestoreFile_)
+        {
+            takefiles::acquire(f);
+            takefiles::release(pendingRestoreFile_);
+            pendingRestoreFile_ = f;
+        }
     }
     hub_.listenOriginal.store(state.listenOriginal ? 1 : 0);
     post([this, state] { doRestore(state); });

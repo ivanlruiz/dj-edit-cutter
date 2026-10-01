@@ -1,6 +1,8 @@
 // Cuadrícula de FL → AnalysisResult (gridFromHost). Ver djec/grid.h.
 #include "djec/grid.h"
 
+#include "djec/bars.h"
+
 #include <algorithm>
 #include <cmath>
 #include <map>
@@ -309,6 +311,37 @@ AnalysisResult gridFromHost(const CaptureInfo& capture, int barOffsetBeats, Host
     if (meta)
         *meta = m;
     return res;
+}
+
+void applyMusicBounds(AnalysisResult& grid, double musicStart, double musicEnd, double lastOnset)
+{
+    const double dur = std::isfinite(grid.duration) && grid.duration > 0 ? grid.duration : 0;
+    if (!(dur > 0) || !std::isfinite(musicStart) || !std::isfinite(musicEnd) || !std::isfinite(lastOnset))
+        return;
+    auto clamp = [dur](double x) { return std::min(dur, std::max(0.0, x)); };
+    const double ms = clamp(musicStart);
+    const double me = clamp(musicEnd);
+    const double lo = clamp(lastOnset);
+    if (!(me > ms))
+        return;   // sin música: todo sigue contando (nada que buscar)
+    // duración de un beat al final (la mediana de los últimos intervalos; sin beats, nada que comparar)
+    double beatSec = 0;
+    {
+        std::vector<double> d;
+        const std::size_t n = grid.beats.size();
+        for (std::size_t i = n > 9 ? n - 9 : 1; i < n; ++i)
+            if (grid.beats[i] > grid.beats[i - 1])
+                d.push_back(grid.beats[i] - grid.beats[i - 1]);
+        if (!d.empty())
+        {
+            std::sort(d.begin(), d.end());
+            beatSec = d[d.size() / 2];
+        }
+    }
+    const bool continues = beatSec > 0 && me >= dur - kMusicContinuesSec && lo >= dur - beatSec - kLastBarTolerance;
+    grid.musicStart = ms;
+    grid.musicEnd = continues ? dur : me;
+    grid.lastOnset = continues ? dur : lo;
 }
 
 } // namespace djec

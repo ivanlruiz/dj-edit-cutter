@@ -48,7 +48,34 @@ juce::File dataRoot()
 
 juce::File takesDir()
 {
-    return dataRoot().getChildFile("Tomas");
+    const juce::File o = overridden();
+    if (o != juce::File())
+        return o.getChildFile("Tomas");
+    return defaultTakesDir();
+}
+
+juce::File defaultTakesDir()
+{
+#if JUCE_WINDOWS
+    return juce::File::getSpecialLocation(juce::File::windowsLocalAppData)
+        .getChildFile("DJ Edit Cutter")
+        .getChildFile("Tomas");
+#else
+    return juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory)
+        .getChildFile("DJ Edit Cutter")
+        .getChildFile("Tomas");
+#endif
+}
+
+juce::File legacyTakesDir()
+{
+    const juce::File o = overridden();
+    if (o != juce::File())
+        return o.getChildFile("Tomas (antes)");
+    const juce::File old = juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory)
+                               .getChildFile("DJ Edit Cutter")
+                               .getChildFile("Tomas");
+    return old == defaultTakesDir() ? juce::File() : old;
 }
 
 juce::File exportsDir()

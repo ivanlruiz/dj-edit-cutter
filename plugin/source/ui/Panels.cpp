@@ -61,6 +61,12 @@ int fadeIndexFor (double beats)
 }
 
 juce::int64 nowMs() { return juce::Time::currentTimeMillis(); }
+
+// «Compás original» (cuadrícula de FL): Auto + los compases más comunes (id = 1000 + num · 100 + den)
+constexpr int kSourceAutoId = 1;
+constexpr int kSourceMeters[][2] = { { 2, 4 }, { 3, 4 }, { 4, 4 }, { 5, 4 }, { 6, 4 }, { 7, 4 },
+                                     { 3, 8 }, { 5, 8 }, { 6, 8 }, { 7, 8 }, { 9, 8 }, { 12, 8 } };
+int sourceMeterId (int num, int den) { return num > 0 && den > 0 ? 1000 + num * 100 + den : kSourceAutoId; }
 } // namespace
 
 bool sameSettings (const djec::EditSettings& a, const djec::EditSettings& b)
@@ -333,6 +339,24 @@ GridPanel::GridPanel (UiContext& c) : Panel (c, 1, T (str::gridTitle))
     };
     addAndMakeVisible (meterBox);
 
+    sourceBox.addItem (T (str::sourceMeterAuto), kSourceAutoId);
+    for (const auto& m : kSourceMeters)
+        sourceBox.addItem (juce::String (m[0]) + "/" + juce::String (m[1]), sourceMeterId (m[0], m[1]));
+    sourceBox.setSelectedId (kSourceAutoId, juce::dontSendNotification);
+    styleCombo (sourceBox, T (str::sourceMeterTip));
+    sourceBox.setTitle (T (str::sourceMeter));
+    sourceBox.onChange = [this] {
+        const int id = sourceBox.getSelectedId();
+        pendingSource = id;
+        pendingSourceSince = nowMs();
+        if (id <= kSourceAutoId)
+            ctx.processor.setSourceMeter (0, 0);
+        else
+            ctx.processor.setSourceMeter ((id - 1000) / 100, (id - 1000) % 100);
+    };
+    addChildComponent (sourceBox);
+    addChildComponent (sourceLabel);
+
     onePrev.onClick = [this] { ctx.processor.moveDownbeat (-1, ctx.referenceTime ? ctx.referenceTime() : 0.0); };
     oneNext.onClick = [this] { ctx.processor.moveDownbeat (1, ctx.referenceTime ? ctx.referenceTime() : 0.0); };
     addAndMakeVisible (onePrev);
@@ -360,6 +384,18 @@ GridPanel::GridPanel (UiContext& c) : Panel (c, 1, T (str::gridTitle))
 
     addChildComponent (spinner);
     addChildComponent (lowConf);
+}
+
+void GridPanel::syncSourceBox (int num, int den)
+{
+    const int id = sourceMeterId (num, den);
+    if (pendingSource >= 0 && (pendingSource == id || nowMs() - pendingSourceSince > 2500))
+        pendingSource = -1;
+    if (pendingSource >= 0 || sourceBox.isPopupActive())
+        return;
+    if (id != kSourceAutoId && sourceBox.indexOfItemId (id) < 0)   // un compás de un estado guardado que no está en la lista
+        sourceBox.addItem (juce::String (num) + "/" + juce::String (den), id);
+    sourceBox.setSelectedId (id, juce::dontSendNotification);
 }
 
 GridMode GridPanel::shownMode() const
@@ -433,7 +469,8 @@ void GridPanel::update (const djec::plugin::ViewState& vs, bool sessionChanged)
     else if (! detect && s.source == djec::plugin::TakeSource::File && ! s.placed)
         info.setText (T (str::gridFilePending));
     else if (! detect)
-        info.setText (s.hostMeta.valid ? text::hostInfo (s.displayBpm, s.hostMeta.tsNum, s.hostMeta.tsDen) : T (str::hostNoInfo));
+        info.setText (s.hostMeta.valid ? text::hostInfo (s.displayBpm, s.hostMeta.tsNum, s.hostMeta.tsDen, s.meterOrigin)
+                                       : T (str::hostNoInfo));
     else if (analyzed)
         info.setText (text::detectInfo (s.grid.bpm, s.grid.beatsPerBar));
     else
@@ -477,6 +514,13 @@ void GridPanel::update (const djec::plugin::ViewState& vs, bool sessionChanged)
         pendingMeter = -1;
     if (pendingMeter < 0 && ! meterBox.isPopupActive())
         meterBox.setSelectedId (s.detect.meterChoice >= 2 ? s.detect.meterChoice : 1, juce::dontSendNotification);
+    // «Compás original» (solo cuadrícula de FL, con la toma en la línea de tiempo)
+    const bool showSource = ! detect && hasTake && ! filePending;
+    setVisibleIf (sourceBox, showSource);
+    setVisibleIf (sourceLabel, showSource);
+    sourceBox.setEnabled (canCorrect);
+    sourceLabel.setEnabled (canCorrect);
+    syncSourceBox (s.sourceMeterNum, s.sourceMeterDen);
     const bool canMove = canCorrect && (detect ? analyzed : s.gridValid);
     onePrev.setEnabled (canMove);
     oneNext.setEnabled (canMove);
@@ -608,6 +652,28 @@ int GridPanel::layoutBody (juce::Rectangle<int> area, bool apply)
                     row.removeFromRight (8);
                     meterLabel.setBounds (row);
                 }
+            }
+        }
+    }
+    if (sourceBox.isVisible())
+    {
+        // «Compás original» [Auto (de FL) ▾]; en una columna estrecha la etiqueta va encima
+        const int bw = juce::jmax (textWidth (uiFont (theme::fontBody, true), T (str::sourceMeterAuto)) + 44, 120);
+        const bool stack = sourceLabel.idealWidth() + 8 + bw > w;
+        st.gap (kGap + 3);
+        if (stack)
+        {
+            st.place (sourceLabel, 20);
+            st.gap (4);
+        }
+        auto row = st.take (kRowH);
+        if (apply)
+        {
+            sourceBox.setBounds (stack ? row.withWidth (juce::jmin (row.getWidth(), bw)) : row.removeFromRight (bw));
+            if (! stack)
+            {
+                row.removeFromRight (8);
+                sourceLabel.setBounds (row);
             }
         }
     }

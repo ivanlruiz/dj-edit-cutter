@@ -497,6 +497,26 @@ AnalysisResult Analyzer::analyze(const float* mono, std::size_t n, double sample
     return impl_->result();
 }
 
+MusicBoundsResult analyzeBounds(const float* mono, std::size_t n, double sampleRate)
+{
+    // mismos pasos (y mismas comprobaciones) que el principio de Analyzer::analyze
+    if (!mono && n > 0)
+        throw std::invalid_argument("no hay muestras de audio");
+    const double sr = sampleRate;
+    if (!(sr >= 3000 && sr <= 384000))
+        throw std::invalid_argument("frecuencia de muestreo no válida");
+    MusicBoundsResult r;
+    r.duration = double(n) / sr;
+    const std::vector<float> samples = analysis::prepareSamples(mono, n, sr);
+    analysis::Features features = analysis::computeFeatures(samples.data(), samples.size(), kAnalysisSampleRate);
+    features.sampleRate = kAnalysisSampleRate;
+    const analysis::MusicBounds bounds = analysis::findMusicBounds(samples.data(), samples.size(), kAnalysisSampleRate);
+    r.musicStart = bounds.musicStart;
+    r.musicEnd = bounds.musicEnd;
+    r.lastOnset = analysis::findLastOnset(features, bounds.musicEnd);
+    return r;
+}
+
 AnalysisResult Analyzer::retrack(double bpmHint, bool strict, ProgressFn progress)
 {
     if (!impl_)

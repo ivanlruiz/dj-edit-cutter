@@ -34,4 +34,19 @@ struct HostGridMeta
  */
 AnalysisResult gridFromHost(const CaptureInfo& capture, int barOffsetBeats = 0, HostGridMeta* meta = nullptr);
 
+/** La música sigue sonando si termina a menos de esto del final de la toma (s). */
+constexpr double kMusicContinuesSec = 0.05;
+
+/**
+ * Pone en una cuadrícula de FL los límites de la música de la toma (los de djec::analyzeBounds, los mismos de la web)
+ * en vez de musicEnd = lastOnset = duración: así el silencio o la resonancia del final no cuentan como compases.
+ * «Quitar compases del final» cuenta desde el compás del golpe final y «Recortar cada compás» deja intactos ese compás
+ * y los de después (como la web).
+ * Excepción (el plugin toma tramos de una canción): si la música sigue sonando al final de la toma (musicEnd a menos de
+ * kMusicContinuesSec del final y el último golpe dentro del último beat + kLastBarTolerance), la toma cortó la canción
+ * a mitad: el «golpe final» es el final de la toma (musicEnd = lastOnset = duración) y cuentan todos los compases
+ * completos, como antes. Sin música (musicEnd <= musicStart) no cambia nada. Valores fuera de [0, duración] se limitan.
+ */
+void applyMusicBounds(AnalysisResult& grid, double musicStart, double musicEnd, double lastOnset);
+
 } // namespace djec

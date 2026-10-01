@@ -35,6 +35,17 @@ enum class GridMode
     Detect   // «Detectar del audio»: análisis portado de la web
 };
 
+/**
+ * De dónde sale el compás original de la cuadrícula de FL (el que se recorta: el plugin pide poner FL en el compás
+ * NUEVO, y una toma posterior leería ese compás de FL sobre un audio que sigue en el original).
+ */
+enum class MeterOrigin
+{
+    Host,        // el que informó FL durante la toma
+    FirstTake,   // FL estaba en el compás nuevo que pide el plugin: se usa el de la primera toma (recordado)
+    Manual       // «Compás original» elegido a mano
+};
+
 /** De dónde salió el audio de la toma. */
 enum class TakeSource
 {
@@ -158,6 +169,10 @@ struct SessionView
     std::vector<djec::Bar> bars;
     int lastBarIndex = -1;                // compás del golpe final (findLastBarIndex)
     int barOffsetBeats = 0;               // «Mover el 1» en la cuadrícula de FL
+    MeterOrigin meterOrigin = MeterOrigin::Host;   // de dónde sale el compás de la cuadrícula de FL (hostMeta)
+    int sourceMeterNum = 0, sourceMeterDen = 0;    // «Compás original» elegido (0 = Auto, de FL)
+    int takeHostNum = 0, takeHostDen = 0;          // compás que informó FL durante la toma (0 = no se sabe)
+    int rememberedNum = 0, rememberedDen = 0;      // compás de la primera toma, recordado (0 = ninguno)
     double displayBpm = 0;                // FL: tempo del proyecto; detectado: grid.bpm
     juce::String gridSourceText;          // "Cuadrícula de FL" | "Detectado del audio"
     juce::String confidenceLabel;         // "Detección fiable" | "Detección aceptable" | "Revisa la cuadrícula" | ""

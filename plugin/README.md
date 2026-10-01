@@ -74,7 +74,10 @@ de onda con la cuadrícula: líneas finas en cada tiempo y números en cada «1�
   **Otro compás…**. En la onda, lo que se quita se ve en **rojo** y lo que se repite en **verde** («×2»).
   **Suavizado de empalmes** (5–40 ms, por defecto 10 ms) es el crossfade de cada empalme: si oyes clics, súbelo.
 - Panel **3 · Quitar compases del final** (desactivado por defecto): elige cuántos compases quitar, el **Fade out**
-  (en beats) y la **Curva del fade** (Lineal, Suave o Exponencial).
+  (en beats) y la **Curva del fade** (Lineal, Suave o Exponencial). Como en la web, se cuentan desde el compás del
+  último golpe: el silencio o la resonancia que haya quedado al final de la toma no cuentan como compases (y
+  **Recortar cada compás** tampoco los toca). Si la toma corta la canción mientras sigue sonando, cuentan todos los
+  compases completos.
 
 Como en la web, siempre se quita o se repite el **final** de cada compás: el «1» queda entero.
 
@@ -83,6 +86,11 @@ Como en la web, siempre se quita o se repite el **final** de cada compás: el «
 El plugin te dice qué compás poner, por ejemplo «Pon el compás del proyecto de FL en 7/8 para que la cuadrícula
 coincida». Cámbialo en FL (en **Options › Project general settings**, el compás del proyecto, *Time signature*): así
 los compases del Playlist coinciden con el audio recortado. Cambiar el compás de FL no borra la toma.
+
+El plugin recuerda el compás original (el de la primera toma): si después vuelve a tomar el audio con FL ya en 7/8
+(porque cambió el audio del canal, el tempo, o pulsaste **Volver a tomar el audio**), sigue usando el 4/4 del audio y
+lo dice en el panel **1 · Compases**: «FL: 120 BPM · 4/4 (compás original de la primera toma)». Si la cuadrícula no
+coincide con la canción, elige el compás a mano en **Compás original** (Auto, 2/4, 3/4, 4/4, 5/4, 6/8, 7/8…).
 
 ### 6. Dale Play otra vez: suena recortado
 
@@ -137,8 +145,10 @@ El silencio no cuenta como cambio: si silencias el canal o borras el clip, la to
 
 ### Al abrir el proyecto otra vez
 
-El plugin guarda sus ajustes en el proyecto de FL y la toma como WAV en `%APPDATA%\DJ Edit Cutter\Tomas`. Al abrir el
-proyecto vuelve a preparar el recorte solo. Si ese WAV ya no está, te pide que le des Play para volver a tomarlo.
+El plugin guarda sus ajustes en el proyecto de FL y la toma como WAV en `%LOCALAPPDATA%\DJ Edit Cutter\Tomas`. Al
+abrir el proyecto vuelve a preparar el recorte solo. Si ese WAV ya no está, te pide que le des Play para volver a
+tomarlo. (Las versiones anteriores las guardaban en `%APPDATA%\DJ Edit Cutter\Tomas`: esos proyectos se siguen
+abriendo bien y su toma pasa sola a la carpeta nueva.)
 
 ## Los compases: de FL o detectados
 
@@ -146,7 +156,8 @@ Panel **1 · Compases**:
 
 - **Cuadrícula de FL** (por defecto): los compases salen del proyecto de FL (tempo, compás e inicio de compás). Es lo
   mejor para audio grabado a tempo con el proyecto. Si el «1» no cae donde debe (por ejemplo, una anacrusa), usa
-  **Mover el 1** ◀ ▶ para moverlo un tiempo.
+  **Mover el 1** ◀ ▶ para moverlo un tiempo. **Compás original** dice en qué compás está el audio: en **Auto** lo
+  toma de FL (y recuerda el de la primera toma cuando FL ya está en el compás nuevo); elige otro si no coincide.
 - **Detectar del audio**: el plugin busca los beats y los compases en el audio tomado, como la app web. Úsalo para
   grabaciones en vivo o canciones importadas que no siguen el tempo de FL. Las correcciones son las de la web:
 
@@ -171,10 +182,11 @@ Escucha siempre el resultado (con el metrónomo de FL si hace falta) antes de ex
 - **Fuera de lo tomado suena el original.** Si das Play en una parte que no se tomó, el plugin avisa: «Esta parte
   todavía no fue tomada: dale Play desde el principio.».
 - Con **Cuadrícula de FL**, el audio tiene que seguir el tempo del proyecto. Si no, usa **Detectar del audio**.
-- **Las tomas ocupan espacio en disco** (un WAV de 32 bits: unos 115 MB por cada 5 minutos en estéreo a 48 kHz) y el
-  plugin no las borra cuando un proyecto las usa. Si necesitas espacio, borra las viejas de
-  `%APPDATA%\DJ Edit Cutter\Tomas` (los proyectos que las usaban te pedirán volver a tomar el audio). Lo mismo con
-  los WAV de **Arrastrar a FL** en `Documentos\DJ Edit Cutter`.
+- **Las tomas ocupan espacio en disco** (un WAV de 32 bits: unos 115 MB por cada 5 minutos en estéreo a 48 kHz), en
+  `%LOCALAPPDATA%\DJ Edit Cutter\Tomas`. El plugin limpia esa carpeta solo: borra las tomas que llevan más de
+  **60 días** sin usarse y, si la carpeta pasa de **3 GB**, las más viejas; nunca una que esté usando un proyecto
+  abierto. Abrir un proyecto cuenta como usar su toma; si la toma de un proyecto se borró, el plugin te pide que le des
+  Play para volver a tomarla. Los WAV de **Arrastrar a FL** en `Documentos\DJ Edit Cutter` no se borran solos.
 - **Probado en Linux y compilado y probado automáticamente en Windows, pero no dentro de FL Studio todavía.**
 
 ## Si algo falla

@@ -16,6 +16,9 @@
 //  5. Cambio de tempo (ppq/bpm distintos de los de la toma en la misma muestra) → la toma deja de valer.
 // La instantánea que suena se fija al empezar cada pasada (Play o salto): un render nuevo suena desde la próxima
 // pasada, nunca a mitad de una (salvo que la toma deje de valer, que corta a original al instante).
+// «De corrido»: la posición de cada bloque es la del anterior + su largo, con una tolerancia de max(2 muestras,
+// 0,5 ms) porque FL puede redondear las posiciones (contiguityToleranceSamples); dentro de la tolerancia manda la
+// cuenta propia (la toma y lo editado siguen sin huecos ni repeticiones).
 #pragma once
 
 #include "Take.h"
@@ -44,6 +47,16 @@ struct ChangeDetectionTuning
     double minCorrelation = 0.5;     // archivo: correlación < 0,5 (insensible a ganancia y EQ suave)
     int windowsToTrigger = 5;        // 5 ventanas seguidas = 1 s
 };
+
+/**
+ * Cuánto puede diferir la posición del host de la esperada (anterior + largo del bloque) sin que sea un salto:
+ * max(2 muestras, 0,5 ms). FL puede redondear las posiciones; más que esto es un salto de verdad.
+ */
+inline std::int64_t contiguityToleranceSamples(double sampleRate) noexcept
+{
+    const auto halfMs = static_cast<std::int64_t>(0.0005 * (sampleRate > 0 ? sampleRate : 44100) + 1e-9);
+    return halfMs > 2 ? halfMs : 2;
+}
 
 class TakeEngine
 {
@@ -130,6 +143,7 @@ private:
     Hub& hub_;
     double sr_ = 0;
     std::int64_t maxTakeSamples_ = 0, minTakeSamples_ = 0, windowLen_ = 1;
+    std::int64_t contiguityTol_ = 2;      // contiguityToleranceSamples(sr_)
     std::uint32_t epoch_ = 0;
     Range R_;
     bool alignPending_ = false;

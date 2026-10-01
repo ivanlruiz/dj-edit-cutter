@@ -48,6 +48,10 @@ void PoolFeeder::setTarget(std::size_t chunks)
 {
     const std::size_t cap = free_.capacity() - 1;
     target_.store(chunks < cap ? chunks : cap, std::memory_order_relaxed);
+    {
+        const std::lock_guard<std::mutex> lock(cvMutex_);
+        kick_ = true;
+    }
     cv_.notify_one();
 }
 
@@ -58,8 +62,27 @@ void PoolFeeder::recycle(Chunk* c)
     {
         const std::lock_guard<std::mutex> lock(recycleMutex_);
         recycled_.push_back(c);
+        numRecycled_.store(recycled_.size(), std::memory_order_relaxed);
+    }
+    // sin despertar al hilo por cada trozo: el worker devuelve una toma entera de golpe (wake() al terminar, o la
+    // próxima vuelta del hilo dentro de kFeederWakeMs)
+}
+
+void PoolFeeder::wake()
+{
+    if (!needsWork())
+        return;
+    {
+        const std::lock_guard<std::mutex> lock(cvMutex_);
+        kick_ = true;
     }
     cv_.notify_one();
+}
+
+bool PoolFeeder::needsWork() const noexcept
+{
+    return free_.sizeApprox() < target_.load(std::memory_order_relaxed) ||
+           numRecycled_.load(std::memory_order_relaxed) > 0;
 }
 
 void PoolFeeder::fillNow()
@@ -76,6 +99,7 @@ void PoolFeeder::refill()
     {
         const std::lock_guard<std::mutex> lock(recycleMutex_);
         recycled.swap(recycled_);
+        numRecycled_.store(0, std::memory_order_relaxed);
     }
     for (Chunk* c : recycled)
     {
@@ -124,12 +148,17 @@ void PoolFeeder::run()
     {
         {
             std::unique_lock<std::mutex> lock(cvMutex_);
-            // cada 4 ms: a 48 kHz un trozo dura 680 ms; aun a 100× de velocidad (render offline) da tiempo
-            cv_.wait_for(lock, std::chrono::milliseconds(4), [this] { return stop_; });
+            // cada kFeederWakeMs (o antes si alguien avisa): hay `target` trozos listos (30 s de audio por defecto)
+            // y en tiempo real el audio gasta como mucho uno cada 85 ms; en render offline, si se acaban, el hilo de
+            // audio reserva los suyos (ahí sí puede)
+            cv_.wait_for(lock, std::chrono::milliseconds(kFeederWakeMs), [this] { return stop_ || kick_; });
             if (stop_)
                 return;
+            kick_ = false;
         }
-        refill();
+        wakeups_.fetch_add(1, std::memory_order_relaxed);
+        if (needsWork())
+            refill();
     }
 }
 

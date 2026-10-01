@@ -34,6 +34,12 @@ TEST_CASE ("rendimiento: toma de 5 minutos (bloques de 512 a 48 kHz)")
     MESSAGE ("processBlock (512 muestras = 10,7 ms de audio): tomando media " << takeAvg << " µs, máx " << takeMax
              << " µs; editado + detección de cambios media " << playAvg << " µs, máx " << playMax << " µs");
     MESSAGE ("toma de 5 min: render listo " << readyMs << " ms después de parar; WAV guardado a los " << savedMs << " ms");
+    // de eso, los límites de la música para la cuadrícula de FL (analyzeBounds: lo que la web usa para el golpe final)
+    const auto tb = std::chrono::steady_clock::now();
+    const djec::MusicBoundsResult b = takeBounds (song, 48000);
+    const double boundsMs = std::chrono::duration<double, std::milli> (std::chrono::steady_clock::now() - tb).count();
+    MESSAGE ("límites de la música de 5 min (analyzeBounds): " << boundsMs << " ms (musicEnd " << b.musicEnd << " s)");
+    CHECK (b.musicEnd == doctest::Approx (300.0).epsilon (0.001));
 #if defined(NDEBUG)
     CHECK (takeAvg < 200);
     CHECK (playAvg < 200);

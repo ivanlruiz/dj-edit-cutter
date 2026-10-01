@@ -27,6 +27,7 @@ constexpr int kNumRecorders = 4;               // grabaciones en vuelo (toma + a
 constexpr int kMaxAnchors = 16384;             // posiciones del host anotadas por grabación
 constexpr double kMinTakeSeconds = 1.0;        // una toma más corta se descarta
 constexpr double kDefaultPoolSeconds = 30;     // margen de trozos libres que se mantiene listo
+constexpr int kFeederWakeMs = 25;              // el hilo que repone trozos mira cada 25 ms (o antes, si lo avisan)
 
 inline std::size_t maxChunksPerTake()
 {
@@ -135,6 +136,11 @@ struct Recorder
 /**
  * Repone los trozos libres desde un hilo propio (así un análisis o una escritura largos del worker no dejan sin
  * memoria a una toma en curso). Mantiene `target` trozos en la cola libre; recicla los que devuelve el worker.
+ *
+ * Coste en reposo: se despierta cada kFeederWakeMs (25 ms) y, si la cola está llena y no hay nada que reciclar, vuelve
+ * a dormir sin tocar ningún mutex compartido. Basta: hay `target` trozos listos (30 s de audio por defecto) y el hilo
+ * de audio gasta como mucho un trozo cada 85 ms (a 384 kHz). recycle(), setTarget() y wake() lo despiertan antes (el
+ * worker llama a wake() cuando ve que la cola bajó); el hilo de audio nunca lo despierta ni lo espera.
  */
 class PoolFeeder
 {
@@ -153,6 +159,10 @@ public:
     void fillNow();
     /** Trozos reservados en total (diagnóstico). */
     long long allocatedApprox() const noexcept { return allocated_.load(std::memory_order_relaxed); }
+    /** Despierta al hilo si a la cola le faltan trozos (worker; nunca el hilo de audio). */
+    void wake();
+    /** Veces que se despertó el hilo (diagnóstico y tests). */
+    long long wakeups() const noexcept { return wakeups_.load(std::memory_order_relaxed); }
 
     void start();
     void stop();
@@ -160,16 +170,20 @@ public:
 private:
     void run();
     void refill();
+    bool needsWork() const noexcept;
 
     SpscQueue<Chunk*> free_;
     std::atomic<std::size_t> target_{0};
     std::atomic<long long> allocated_{0};
+    std::atomic<long long> wakeups_{0};
+    std::atomic<std::size_t> numRecycled_{0};   // recycled_.size() sin tomar el mutex
     std::mutex recycleMutex_;
     std::vector<Chunk*> recycled_;
     std::mutex refillMutex_;   // refill() puede llamarse desde el hilo propio o desde fillNow()
     std::mutex cvMutex_;
     std::condition_variable cv_;
     bool stop_ = false;
+    bool kick_ = false;   // hay algo que hacer ya (bajo cvMutex_)
     std::thread thread_;
 };
 

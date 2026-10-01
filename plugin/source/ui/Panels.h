@@ -138,12 +138,14 @@ private:
     TextBlock info, help;
     Pill confidence;
     RowLabel manualLabel { T (str::tempoManual) }, meterLabel { T (str::beatsPerBar) },
-        oneLabel { T (str::moveOne) };
+        oneLabel { T (str::moveOne) }, sourceLabel { T (str::sourceMeter) };
     juce::TextButton tempoDouble { T (str::tempoDouble) }, tempoHalf { T (str::tempoHalf) }, applyBpm { T (str::apply) },
         tapButton { T (str::tap) }, thisOne { T (str::thisBeatIsOne) }, resetButton { T (str::reset) };
     juce::TextEditor bpm;
     TextBlock tapValue;
     juce::ComboBox meterBox;
+    juce::ComboBox sourceBox;   // «Compás original» (cuadrícula de FL)
+    void syncSourceBox (int num, int den);
     IconButton onePrev { IconButton::Icon::Prev, T (str::moveOnePrevTip) },
         oneNext { IconButton::Icon::Next, T (str::moveOneNextTip) };
     Spinner spinner;
@@ -154,6 +156,8 @@ private:
     int pendingMode = -1;
     juce::int64 pendingSince = 0;
     int pendingMeter = -1;
+    int pendingSource = -1;   // id elegido en «Compás original» hasta que la sesión lo refleje
+    juce::int64 pendingSourceSince = 0;
     std::vector<double> taps;
     bool hasTake = false, detect = false, busy = false;
 };

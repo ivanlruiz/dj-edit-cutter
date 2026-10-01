@@ -41,6 +41,27 @@ AlignState alignFrom (const juce::String& s)
     return AlignState::None;
 }
 
+/** "7/8" (num = 0: ""). */
+juce::String meterId (int num, int den)
+{
+    return num > 0 && den > 0 ? juce::String (num) + "/" + juce::String (den) : juce::String();
+}
+
+/** "7/8" → (7, 8); cualquier otra cosa → (0, 0). */
+void meterFrom (const juce::String& s, int& num, int& den)
+{
+    num = den = 0;
+    if (! s.containsChar ('/'))
+        return;
+    const int n = s.upToFirstOccurrenceOf ("/", false, false).trim().getIntValue();
+    const int d = s.fromFirstOccurrenceOf ("/", false, false).trim().getIntValue();
+    if (n >= 1 && n <= 64 && (d == 2 || d == 4 || d == 8 || d == 16))
+    {
+        num = n;
+        den = d;
+    }
+}
+
 juce::String encodeAnchors (const std::vector<AnchorEntry>& anchors)
 {
     juce::MemoryOutputStream o;
@@ -240,6 +261,10 @@ void DjecAudioProcessor::getStateInformation (juce::MemoryBlock& destData)
     s.setProperty ("gridMode", gridModeId (ps.gridMode), nullptr);
     s.setProperty ("barOffset", ps.barOffsetBeats, nullptr);
     s.setProperty ("listenOriginal", ps.listenOriginal, nullptr);
+    // «Compás original»: "auto" o "7/8"; el recordado de la primera toma: "4/4" + fase en ppq
+    s.setProperty ("sourceMeter", ps.sourceMeterNum > 0 ? meterId (ps.sourceMeterNum, ps.sourceMeterDen) : juce::String ("auto"), nullptr);
+    s.setProperty ("rememberedMeter", meterId (ps.rememberedNum, ps.rememberedDen), nullptr);
+    s.setProperty ("rememberedPhase", ps.rememberedPhasePpq, nullptr);
     state.addChild (s, -1, nullptr);
 
     juce::ValueTree d ("Detect");
@@ -267,6 +292,8 @@ void DjecAudioProcessor::getStateInformation (juce::MemoryBlock& destData)
     t.setProperty ("fileStartBar", ps.fileStartBar, nullptr);
     t.setProperty ("trackName", ps.trackName, nullptr);
     t.setProperty ("anchors", encodeAnchors (ps.anchors), nullptr);
+    t.setProperty ("meterFromMemory", ps.meterFromMemory, nullptr);
+    t.setProperty ("hostMeter", meterId (ps.takeHostNum, ps.takeHostDen), nullptr);
     state.addChild (t, -1, nullptr);
 
     if (auto xml = state.createXml())
@@ -298,6 +325,11 @@ void DjecAudioProcessor::setStateInformation (const void* data, int sizeInBytes)
         ps.gridMode = s.getProperty ("gridMode", "fl").toString() == "detect" ? GridMode::Detect : GridMode::Host;
         ps.barOffsetBeats = s.getProperty ("barOffset", 0);
         ps.listenOriginal = s.getProperty ("listenOriginal", false);
+        meterFrom (s.getProperty ("sourceMeter", "auto").toString(), ps.sourceMeterNum, ps.sourceMeterDen);
+        if (ps.sourceMeterNum > 32)
+            ps.sourceMeterNum = ps.sourceMeterDen = 0;
+        meterFrom (s.getProperty ("rememberedMeter", "").toString(), ps.rememberedNum, ps.rememberedDen);
+        ps.rememberedPhasePpq = s.getProperty ("rememberedPhase", 0.0);
     }
     const auto d = state.getChildWithName ("Detect");
     if (d.isValid())
@@ -333,6 +365,8 @@ void DjecAudioProcessor::setStateInformation (const void* data, int sizeInBytes)
         ps.fileStartBar = t.getProperty ("fileStartBar", 0);
         ps.trackName = t.getProperty ("trackName", "").toString();
         ps.anchors = decodeAnchors (t.getProperty ("anchors", "").toString());
+        ps.meterFromMemory = t.getProperty ("meterFromMemory", false);
+        meterFrom (t.getProperty ("hostMeter", "").toString(), ps.takeHostNum, ps.takeHostDen);
     }
     worker.restore (ps);
 }
@@ -482,6 +516,8 @@ GridMode DjecAudioProcessor::getGridMode() const { return worker.view()->gridMod
 
 void DjecAudioProcessor::setBarOffset (int beats) { worker.setBarOffset (beats); }
 
+void DjecAudioProcessor::setSourceMeter (int num, int den) { worker.setSourceMeter (num, den); }
+
 void DjecAudioProcessor::retrack (double bpmHint, bool strict) { worker.retrack (bpmHint, strict); }
 
 void DjecAudioProcessor::relabel (int beatsPerBar, const std::vector<int>& forcedDownbeats)
@@ -579,6 +615,10 @@ juce::File DjecAudioProcessor::writeDragFile (juce::String* error)
 }
 
 bool DjecAudioProcessor::waitForWorker (int timeoutMs) { return worker.waitIdle (timeoutMs); }
+
+void DjecAudioProcessor::setTakeCleanupPolicy (const takefiles::Policy& policy) { worker.setCleanupPolicy (policy); }
+
+long long DjecAudioProcessor::backgroundWakeups() const noexcept { return hub->pool.wakeups() + worker.wakeups(); }
 
 void DjecAudioProcessor::setTakePoolSeconds (double seconds)
 {

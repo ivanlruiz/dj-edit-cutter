@@ -76,6 +76,8 @@ Guía de uso para el usuario: [README.md](README.md). Diseño: `docs/diseno/` (l
     sin bloqueos y sin E/S: habla con el resto por las colas del `Hub` (`Take.h`, `ChunkPool.h`).
   - `Worker`: el hilo de fondo; dueño de la toma, la cuadrícula, el plan y el render. Publica una
     `PlaybackSnapshot` al audio (puntero atómico) y una `SessionView` inmutable a la interfaz (`PluginState.h`).
+  - `TakeFiles` y `Paths`: carpeta de las tomas (`%LOCALAPPDATA%\DJ Edit Cutter\Tomas` en Windows), registro de los
+    WAV en uso (de todo el proceso) y la limpieza (3 GB / 60 días, nunca un archivo en uso), que corre en el worker.
   - `PluginProcessor`: el `AudioProcessor` de JUCE, el estado del proyecto y la API que usa la interfaz.
   - `PluginEditor` y `ui/`: la interfaz (todos los textos en `ui/Strings.h`).
 - `tests/host/`: simulan a FL (cabezal falso, bloques de cualquier tamaño) contra el procesador; `alloc_test.cpp`

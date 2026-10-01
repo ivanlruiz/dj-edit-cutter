@@ -204,6 +204,35 @@ TEST_CASE("analysis: banda sintética a 120 BPM — beats, tempo, compás 4/4 y 
     CHECK(r.confBeats >= 0.5);
 }
 
+TEST_CASE("analysis: analyzeBounds da los mismos límites que analyze() (sin tempo, beats ni compases)")
+{
+    Song s = bandSong(120, 12);
+    const std::size_t music = s.x.size();
+    s.x.resize(music + static_cast<std::size_t>(4 * SR), 0.0f);   // 4 s de silencio al final
+    djec::Analyzer an;
+    const djec::AnalysisResult r = an.analyze(s.x.data(), s.x.size(), SR);
+    const djec::MusicBoundsResult b = djec::analyzeBounds(s.x.data(), s.x.size(), SR);
+    CHECK(b.duration == r.duration);
+    CHECK(b.musicStart == r.musicStart);
+    CHECK(b.musicEnd == r.musicEnd);
+    CHECK(b.lastOnset == r.lastOnset);
+    CHECK(b.musicEnd < static_cast<double>(music) / SR + 0.5);
+    CHECK(std::fabs(b.lastOnset - s.beats.back()) < 0.05);
+    // a otra frecuencia (remuestreo de respaldo) también coincide
+    const std::vector<float> x16 = djec::resample(s.x.data(), s.x.size(), SR, 16000);
+    const djec::AnalysisResult r16 = an.analyze(x16.data(), x16.size(), 16000);
+    const djec::MusicBoundsResult b16 = djec::analyzeBounds(x16.data(), x16.size(), 16000);
+    CHECK(b16.musicEnd == r16.musicEnd);
+    CHECK(b16.lastOnset == r16.lastOnset);
+    // silencio y vacío: límites en 0; errores como analyze()
+    const std::vector<float> silence(static_cast<std::size_t>(3 * SR), 0.0f);
+    const djec::MusicBoundsResult z = djec::analyzeBounds(silence.data(), silence.size(), SR);
+    CHECK(z.musicEnd == 0);
+    CHECK(z.lastOnset == 0);
+    CHECK(djec::analyzeBounds(nullptr, 0, SR).duration == 0);
+    CHECK_THROWS_AS(djec::analyzeBounds(silence.data(), silence.size(), 100), std::invalid_argument);
+}
+
 TEST_CASE("analysis: silencio, audio vacío y 10 muestras dan un resultado vacío válido con confianza 0")
 {
     djec::Analyzer an;

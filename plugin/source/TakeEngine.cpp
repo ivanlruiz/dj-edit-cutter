@@ -99,6 +99,7 @@ void TakeEngine::prepare(double sampleRate, int /*maxBlockSize*/)
     maxTakeSamples_ = static_cast<std::int64_t>(std::floor(kMaxTakeSeconds * sr_));
     minTakeSamples_ = static_cast<std::int64_t>(std::ceil(kMinTakeSeconds * sr_));
     windowLen_ = std::max<std::int64_t>(64, static_cast<std::int64_t>(std::llround(tuning.windowSec * sr_)));
+    contiguityTol_ = contiguityToleranceSamples(sr_);
     resetChangeWindow();
     cdDiffWindows_ = 0;
     tempoMismatch_ = 0;
@@ -324,11 +325,27 @@ void TakeEngine::process(float* const* ch, int numIn, int numOut, int n, const B
         return;   // la entrada pasa tal cual
     }
 
-    const std::int64_t p = bp.timeInSamples;
-    if (inPass_ && p != expectedNext_)
-        endPass(PassEnd::Jump);
+    // FL puede redondear la posición: una diferencia de hasta contiguityTol_ con lo esperado (posición anterior + largo
+    // del bloque anterior) sigue siendo de corrido, y se usa la posición esperada (el audio llega de corrido aunque el
+    // número informado tiemble); más que eso es un salto.
+    std::int64_t p = bp.timeInSamples;
+    if (inPass_)
+    {
+        const std::int64_t d = p - expectedNext_;
+        if (d >= -contiguityTol_ && d <= contiguityTol_)
+            p = expectedNext_;
+        else
+            endPass(PassEnd::Jump);
+    }
     if (!inPass_)
+    {
+        // Play justo donde terminó la toma (FL puede informar unas muestras de más o de menos): sigue de corrido
+        // con ella, así se agrega lo de detrás sin huecos
+        if (R_.valid && R_.extendable && !alignPending_ && p != R_.E && p - R_.E >= -contiguityTol_
+            && p - R_.E <= contiguityTol_)
+            p = R_.E;
         startPass(p);
+    }
 
     editedNow_ = false;
     outsideNow_ = false;

@@ -50,6 +50,10 @@ public:
     bool playing = false;
     std::int64_t time = 0;
     bool provideInfo = true;
+    /** La posición en muestras informada difiere del audio que llega en tantas muestras (FL redondeando posiciones). */
+    std::int64_t reportOffset = 0;
+    /** El ppq informado sale de esa posición informada (si no, de la del audio, que avanza de corrido). */
+    bool ppqFollowsReport = false;
 
     double ppqAt (std::int64_t t) const { return static_cast<double> (t) / sampleRate * bpm / 60.0; }
 
@@ -58,10 +62,11 @@ public:
         if (! provideInfo)
             return {};
         PositionInfo p;
+        const std::int64_t reported = time + reportOffset;
         p.setIsPlaying (playing);
-        p.setTimeInSamples (time);
-        p.setTimeInSeconds (static_cast<double> (time) / sampleRate);
-        const double ppq = ppqAt (time);
+        p.setTimeInSamples (reported);
+        p.setTimeInSeconds (static_cast<double> (reported) / sampleRate);
+        const double ppq = ppqAt (ppqFollowsReport ? reported : time);
         p.setPpqPosition (ppq);
         p.setBpm (bpm);
         p.setTimeSignature (TimeSignature { num, den });
@@ -311,7 +316,21 @@ inline Audio slice (const Audio& a, std::int64_t i0, std::int64_t i1)
     return out;
 }
 
-/** Render esperado de una toma [A, A + n) con la cuadrícula de un host de tempo constante. */
+/** Límites de la música de una toma, como los calcula el plugin para la cuadrícula de FL (analyzeBounds). */
+inline djec::MusicBoundsResult takeBounds (const Audio& take, double sr)
+{
+    std::vector<const float*> ptrs;
+    for (const auto& c : take)
+        ptrs.push_back (c.data());
+    const std::vector<float> mono = djec::toAnalysisMono (ptrs.data(), static_cast<int> (ptrs.size()),
+                                                          static_cast<std::size_t> (frames (take)), sr);
+    return djec::analyzeBounds (mono.data(), mono.size(), djec::kAnalysisSampleRate);
+}
+
+/**
+ * Render esperado de una toma [A, A + n) con la cuadrícula de un host de tempo constante (y los límites de la música de
+ * la toma, como el plugin: djec::applyMusicBounds).
+ */
 inline Audio expectedHostEdit (const Audio& take, double sr, std::int64_t A, double bpm, int num, int den,
                                const djec::EditSettings& s, djec::EditPlan* planOut = nullptr)
 {
@@ -330,7 +349,9 @@ inline Audio expectedHostEdit (const Audio& take, double sr, std::int64_t A, dou
     i.ppqValid = i.barValid = true;
     cap.blocks.emplace_back (0, i);
     djec::HostGridMeta meta;
-    const djec::AnalysisResult grid = djec::gridFromHost (cap, 0, &meta);
+    djec::AnalysisResult grid = djec::gridFromHost (cap, 0, &meta);
+    const djec::MusicBoundsResult b = takeBounds (take, sr);
+    djec::applyMusicBounds (grid, b.musicStart, b.musicEnd, b.lastOnset);
     const djec::EditPlan plan = djec::buildEditPlan (grid, meta.tsDen, s);
     if (planOut != nullptr)
         *planOut = plan;

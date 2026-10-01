@@ -81,6 +81,12 @@ public:
     djec::plugin::GridMode getGridMode() const;
     /** Cuadrícula de FL: «Mover el 1 ◀ ▶» (tiempos; positivo = el "1" pasa al tiempo siguiente). */
     void setBarOffset (int beats);
+    /**
+     * Cuadrícula de FL: «Compás original». num = 0 → Auto (el que informa FL; si FL ya está en el compás nuevo que pide
+     * el plugin, el de la primera toma, que se recuerda). Si no, num/den (1..32 / 2, 4, 8, 16) para esta toma y las
+     * siguientes. Ver SessionView::meterOrigin.
+     */
+    void setSourceMeter (int num, int den);
 
     /** Detectar del audio (como la web): Tempo ×2 / ÷2 / manual / Marcar tempo → retrack(bpm, true);
         bpmHint 0 = detección automática. */
@@ -132,6 +138,11 @@ public:
     /** Margen de trozos libres para tomar audio (segundos). Por defecto 30. */
     void setTakePoolSeconds (double seconds);
     djec::plugin::TakeEngine& getEngine() noexcept { return engine; }
+    djec::plugin::Hub& getHub() noexcept { return *hub; }
+    /** Política para borrar tomas viejas (por defecto: 3 GB, 60 días; ver TakeFiles.h). */
+    void setTakeCleanupPolicy (const djec::plugin::takefiles::Policy& policy);
+    /** Veces que se despertaron los hilos de fondo (repositorio de trozos + worker): diagnóstico del reposo. */
+    long long backgroundWakeups() const noexcept;
 
 private:
     djec::plugin::BlockPosition readPosition() const noexcept;

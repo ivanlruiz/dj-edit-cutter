@@ -9,6 +9,7 @@
 
 #include "PluginState.h"
 #include "Take.h"
+#include "TakeFiles.h"
 
 #include "djec/analysis.h"
 #include "djec/capture_info.h"
@@ -37,6 +38,10 @@ struct PersistedState
     DetectState detect;
     bool listenOriginal = false;
     juce::String trackName;
+    // compás original de la cuadrícula de FL
+    int sourceMeterNum = 0, sourceMeterDen = 0;     // «Compás original» elegido a mano (0 = Auto, de FL)
+    int rememberedNum = 0, rememberedDen = 0;       // el de la primera toma (0 = todavía ninguno)
+    double rememberedPhasePpq = 0;                  // ppq de un "1" de ese compás (módulo el largo del compás)
     // toma
     TakeSource source = TakeSource::None;
     juce::File takeFile;                 // WAV en Tomas/ o el archivo soltado
@@ -50,6 +55,8 @@ struct PersistedState
     std::vector<AnchorEntry> anchors;    // posición del host durante la toma (offset = muestra de la toma)
     AlignState align = AlignState::None; // archivo: Found / Manual = ubicado
     int fileStartBar = 0;
+    bool meterFromMemory = false;        // FL estaba en el compás nuevo: las anclas usan el compás recordado
+    int takeHostNum = 0, takeHostDen = 0;// compás que informó FL durante la toma
 };
 
 /** Lo necesario para exportar lo editado (una copia barata: el audio va por shared_ptr). */
@@ -87,6 +94,11 @@ public:
     void setSettings(const djec::EditSettings& s);
     void setListenOriginal(bool original);
     void setTrackName(const juce::String& name);
+    /**
+     * «Compás original» de la cuadrícula de FL: num = 0 → Auto (el que informa FL; si FL ya está en el compás nuevo que
+     * pide el plugin, el de la primera toma). Si no, ese compás para la toma actual y las siguientes.
+     */
+    void setSourceMeter(int num, int den);
     /** Carga un estado guardado (los ajustes se aplican ya; la toma, en el worker). */
     void restore(const PersistedState& state);
     /** Avisos que la interfaz ya mostró y el usuario cerró. */
@@ -102,6 +114,10 @@ public:
 
     /** Tests: espera a que no quede trabajo pendiente (cola, avisos del audio, reconstrucción). */
     bool waitIdle(int timeoutMs);
+    /** Tests: política para borrar tomas viejas (por defecto la de takefiles::Policy). */
+    void setCleanupPolicy(const takefiles::Policy& policy);
+    /** Veces que se despertó el hilo (diagnóstico y tests). */
+    long long wakeups() const noexcept { return wakeups_.load(std::memory_order_relaxed); }
 
 private:
     struct Model;
@@ -125,12 +141,31 @@ private:
     void publishView();
     void saveTakeWav();
     void forgetTakeFile();
+    /** Cambia el WAV de la toma (registro de archivos en uso). */
+    void setTakeWav(const juce::File& file);
+    /** Limpieza de tomas viejas (takefiles::cleanup en Tomas y en la carpeta de antes). */
+    void runCleanup();
+    /** En cada vuelta: «toca» el WAV en uso cada tanto y la limpieza de arranque. */
+    void maintainTakeFiles();
+    /** ¿Hay algo en marcha? (el hilo mira más seguido) */
+    bool activeNow();
+
+    /**
+     * Compás de las anclas de una toma nueva (o de lo agregado delante/detrás) con «Compás original» en Auto: si FL
+     * informa el compás nuevo que pide el plugin (el destino de «Recortar cada compás») y no el recordado, se usa el
+     * recordado (con su fase); si no, el de FL pasa a ser el recordado. Ver normalizeAnchors en Worker.cpp.
+     */
+    void normalizeAnchors(std::vector<AnchorEntry>& anchors, double sampleRate, bool newTake);
+    void persistTakeMeter();
+    /** Límites de la música de la toma (analyzeBounds o, si ya se analizó, los de la detección). */
+    void ensureBounds();
 
     void relabelNow(int beatsPerBar, const std::vector<int>& forced);
     void doLoadFile(const juce::File& file, bool restoring, const PersistedState* restoreState);
     void tryAlign();
+    /** restored: estado guardado (anclas ya normalizadas, compás de inicio guardado). */
     void placeFile(std::int64_t A, const std::vector<AnchorEntry>& anchorsRelToTake, AlignState how,
-                   double confidence);
+                   double confidence, const PersistedState* restored = nullptr);
     void doRestore(const PersistedState& ps);
 
     void addNotice(const juce::String& key, NoticeKind kind, const juce::String& text);
@@ -157,11 +192,20 @@ private:
     std::shared_ptr<const SessionView> view_;
     ExportData export_;
     bool takeFileReferenced_ = false;        // la toma ya se guardó en un proyecto: no se borra su WAV
+    takefiles::Policy cleanupPolicy_;
+    juce::File pendingRestoreFile_;          // WAV de un estado por cargar (en uso hasta que se carga)
 
     std::atomic<double> hostRate_{0};
     std::atomic<bool> rebuildPending_{false};
     std::atomic<std::uint64_t> viewVersion_{0};
     std::atomic<std::uint64_t> noticeCounter_{0};
+    std::atomic<long long> wakeups_{0};
+
+    // solo el hilo del worker
+    juce::int64 startedMs_ = 0;
+    bool startupCleanupDone_ = false;
+    juce::int64 lastTouchMs_ = 0;
+    juce::int64 lastActiveMs_ = 0;
 
     mutable std::mutex progressMutex_;
     juce::String progressStage_;

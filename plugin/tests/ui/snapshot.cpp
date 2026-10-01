@@ -569,6 +569,26 @@ int main (int argc, char** argv)
         snapshot (h, "08-fuera-de-la-toma", opt);
         h.idle (4);
     }
+    // 3a) FL ya en 7/8 (lo que pide el plugin) y se vuelve a tomar: el compás original es el de la primera toma;
+    //     y «Compás original» elegido a mano
+    {
+        std::cout << "compas original" << std::endl;
+        Host h;
+        h.play (song, 0, songLen);
+        h.stopAndWait();
+        h.head.num = 7;
+        h.head.den = 8;
+        h.proc->clearTake();
+        h.proc->waitForWorker (60000);
+        h.play (song, 0, songLen);
+        h.stopAndWait();
+        h.parkAt (6.2);
+        snapshot (h, "03c-compas-original-recordado", opt);
+        h.proc->setSourceMeter (3, 4);
+        h.proc->waitForWorker (60000);
+        h.idle (2);
+        snapshot (h, "03d-compas-original-a-mano", opt);
+    }
     // 3b) cambió el audio del canal (otro clip en el mismo sitio) y cambió el tempo del proyecto
     {
         std::cout << "cambios" << std::endl;
