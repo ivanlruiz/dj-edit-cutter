@@ -12,6 +12,13 @@ deja hacer dos cosas, por separado o juntas:
 
 No hay que instalar nada. Funciona en el navegador del ordenador o del móvil.
 
+## Plugin para FL Studio
+
+¿Editas en FL Studio? También hay un plugin VST3 para Windows que hace lo mismo dentro del **Mixer**: lo pones en el
+canal donde suena tu audio, le das Play una vez para que tome el audio y, desde el siguiente Play, el canal suena
+recortado y alineado con la línea de tiempo. Después lo arrastras al Playlist o lo exportas como WAV. Instalación y
+uso, paso a paso: **[plugin/README.md](plugin/README.md)**. (Todavía no se ha probado dentro de FL Studio.)
+
 ## Tu música no sale de tu dispositivo
 
 Todo se procesa en tu navegador. La página es estática: no hay ningún servidor que reciba tu música y la canción
@@ -219,6 +226,7 @@ tests/                tests unitarios (*.test.js) y de navegador (*.e2e.mjs)
 tests/synth/          generador de canciones sintéticas con verdad de referencia
 tools/bench.js        benchmark del análisis
 docs/ARQUITECTURA.md  cómo funciona por dentro
+plugin/               plugin VST3 para FL Studio (C++/JUCE): ver plugin/README-dev.md
 ```
 
 ### Publicar

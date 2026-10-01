@@ -1,0 +1,7 @@
+# Builds locales del plugin (CMake). Nunca se suben.
+/build/
+/build-*/
+/out/
+/cmake-build-*/
+/CMakeUserPresets.json
+/.cache/

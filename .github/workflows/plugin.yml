@@ -1,0 +1,260 @@
+name: Plugin VST3
+
+# Compila y prueba el plugin (plugin/) en Linux y Windows, lo valida con pluginval y deja el VST3
+# de Windows como artefacto. Con un tag plugin-vX.Y.Z publica además una release con el .zip.
+
+on:
+  push:
+    branches: ['**']
+    tags: ['plugin-v*']
+    # Los filtros de rutas no se evalúan en los pushes de tags (GitHub), así que un tag siempre compila.
+    paths:
+      - 'plugin/**'
+      - 'js/**'
+      - 'tests/synth/**'
+      - '.github/workflows/plugin.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: plugin-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+env:
+  JUCE_TAG: '8.0.15'
+  PLUGINVAL_VERSION: 'v1.0.4'
+  ARTIFACT_NAME: DJ-Edit-Cutter-VST3-Windows
+
+jobs:
+  linux:
+    name: Linux (GCC + Ninja)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          package-manager-cache: false
+
+      - name: Dependencias del sistema
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ninja-build libasound2-dev libfreetype-dev libfontconfig1-dev libx11-dev libxcomposite-dev \
+            libxcursor-dev libxext-dev libxinerama-dev libxrandr-dev libxrender-dev libgl1-mesa-dev \
+            xvfb fonts-dejavu-core fonts-liberation
+
+      - name: Rutas y versión
+        run: |
+          echo "JUCE_DIR=$RUNNER_TEMP/juce-$JUCE_TAG" >> "$GITHUB_ENV"
+          if [[ "$GITHUB_REF" == refs/tags/plugin-v* ]]; then
+            v="${GITHUB_REF_NAME#plugin-v}"
+            [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::El tag $GITHUB_REF_NAME no es plugin-vX.Y.Z"; exit 1; }
+            echo "DJEC_VERSION_ARG=-DDJEC_VERSION=$v" >> "$GITHUB_ENV"
+          fi
+
+      - name: JUCE (caché)
+        id: juce-cache
+        uses: actions/cache@v6
+        with:
+          path: ${{ env.JUCE_DIR }}
+          key: juce-${{ env.JUCE_TAG }}-${{ runner.os }}
+
+      - name: Descargar JUCE
+        if: steps.juce-cache.outputs.cache-hit != 'true'
+        run: git clone --depth 1 --branch "$JUCE_TAG" https://github.com/juce-framework/JUCE.git "$JUCE_DIR"
+
+      - name: Configurar
+        run: |
+          cmake -S plugin -B plugin/build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DFETCHCONTENT_SOURCE_DIR_JUCE="$JUCE_DIR" ${DJEC_VERSION_ARG:+"$DJEC_VERSION_ARG"}
+
+      - name: Compilar
+        run: cmake --build plugin/build --parallel 4
+
+      - name: Tests (ctest)
+        run: xvfb-run -a ctest --test-dir plugin/build --output-on-failure
+
+      - name: pluginval (strictness 10)
+        run: |
+          pv="$RUNNER_TEMP/pluginval"
+          curl -fsSL -o "$RUNNER_TEMP/pluginval.zip" \
+            "https://github.com/Tracktion/pluginval/releases/download/$PLUGINVAL_VERSION/pluginval_Linux.zip"
+          unzip -o -q "$RUNNER_TEMP/pluginval.zip" -d "$pv"
+          chmod +x "$pv/pluginval"
+          xvfb-run -a "$pv/pluginval" --strictness-level 10 --verbose \
+            --output-dir "$RUNNER_TEMP/pluginval-logs" \
+            --validate "$PWD/plugin/build/DJEditCutter_artefacts/Release/VST3/DJ Edit Cutter.vst3"
+
+      - name: Guardar logs de pluginval si falla
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: pluginval-logs-linux
+          path: ${{ runner.temp }}/pluginval-logs
+          if-no-files-found: ignore
+
+  windows:
+    name: Windows (MSVC)
+    runs-on: windows-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          package-manager-cache: false
+
+      - name: Rutas y versión
+        run: |
+          tmp="$(cygpath -m "$RUNNER_TEMP")"
+          {
+            echo "TMP_DIR=$tmp"
+            echo "JUCE_DIR=$tmp/juce-$JUCE_TAG"
+            echo "VST3_PATH=$(cygpath -m "$PWD")/plugin/build/DJEditCutter_artefacts/Release/VST3/DJ Edit Cutter.vst3"
+            if [[ "$GITHUB_REF" == refs/tags/plugin-v* ]]; then
+              v="${GITHUB_REF_NAME#plugin-v}"
+              [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::El tag $GITHUB_REF_NAME no es plugin-vX.Y.Z" >&2; exit 1; }
+              echo "DJEC_VERSION_ARG=-DDJEC_VERSION=$v"
+              echo "DJEC_VERSION_TEXT=$v"
+            else
+              echo "DJEC_VERSION_TEXT=build ${GITHUB_SHA::7}"
+            fi
+          } >> "$GITHUB_ENV"
+
+      - name: JUCE (caché)
+        id: juce-cache
+        uses: actions/cache@v6
+        with:
+          path: ${{ env.JUCE_DIR }}
+          key: juce-${{ env.JUCE_TAG }}-${{ runner.os }}
+
+      - name: Descargar JUCE
+        if: steps.juce-cache.outputs.cache-hit != 'true'
+        run: git clone --depth 1 --branch "$JUCE_TAG" https://github.com/juce-framework/JUCE.git "$JUCE_DIR"
+
+      # Generador Visual Studio (el más nuevo instalado en el runner), x64, runtime estático.
+      - name: Configurar
+        run: |
+          cmake -S plugin -B plugin/build -A x64 -DDJEC_BUILD_STANDALONE=OFF \
+            -DFETCHCONTENT_SOURCE_DIR_JUCE="$JUCE_DIR" ${DJEC_VERSION_ARG:+"$DJEC_VERSION_ARG"}
+
+      - name: Compilar
+        run: cmake --build plugin/build --config Release --parallel 4
+
+      - name: Tests (ctest)
+        run: ctest --test-dir plugin/build -C Release --output-on-failure
+
+      - name: Empaquetar
+        run: |
+          rm -rf dist && mkdir -p dist
+          cp -R "$VST3_PATH" dist/
+          cat > dist/LEEME.txt <<EOF
+          DJ Edit Cutter - plugin VST3 para FL Studio (Windows, 64 bits)
+          Versión: $DJEC_VERSION_TEXT
+
+          INSTALACIÓN
+          1. Descomprime este .zip.
+          2. Copia la carpeta «DJ Edit Cutter.vst3» entera en:
+                 C:\\Program Files\\Common Files\\VST3
+             Windows te pedirá permiso de administrador: acéptalo.
+          3. Abre FL Studio y ve a Options > Manage plugins. Pulsa el botón que busca plugins nuevos
+             («Find plugins», «Find installed plugins» o «Start scan», según la versión) y espera a que termine.
+          4. En el Mixer, elige el canal que tiene el audio (o el Master), haz clic en un slot vacío
+             y elige «DJ Edit Cutter».
+
+          USO
+          - Dale Play en FL: el plugin toma el audio del canal (mientras tanto escuchas el original).
+          - Cuando pares, el plugin procesa el audio. Desde el próximo Play suena recortado.
+          - También puedes soltar un archivo de audio sobre el plugin: se ubica solo en la línea de tiempo.
+          - Guía completa (en castellano):
+                 $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/blob/$GITHUB_SHA/plugin/README.md
+
+          SI FL NO LO ENCUENTRA
+          - Revisa que exista este archivo:
+                 C:\\Program Files\\Common Files\\VST3\\DJ Edit Cutter.vst3\\Contents\\x86_64-win\\DJ Edit Cutter.vst3
+          - Si Windows bloqueó el .zip descargado: clic derecho en el .zip > Propiedades > marca
+            «Desbloquear» > Aceptar, y vuelve a descomprimirlo.
+          - Vuelve a buscar plugins en Options > Manage plugins.
+          EOF
+          # CRLF + BOM UTF-8 para que el Bloc de notas lo muestre bien (YAML ya quitó la sangría).
+          sed -i 's/$/\r/' dist/LEEME.txt
+          printf '\xEF\xBB\xBF' | cat - dist/LEEME.txt > dist/LEEME.tmp && mv dist/LEEME.tmp dist/LEEME.txt
+          ls -R dist
+
+      - name: Subir artefacto
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: dist/
+          if-no-files-found: error
+
+      # Tras subir el artefacto: si pluginval falla el job queda en rojo (y no hay release), pero el
+      # VST3 sigue disponible para probarlo.
+      - name: pluginval (strictness 10)
+        run: |
+          pv="$TMP_DIR/pluginval"
+          curl -fsSL -o "$TMP_DIR/pluginval.zip" \
+            "https://github.com/Tracktion/pluginval/releases/download/$PLUGINVAL_VERSION/pluginval_Windows.zip"
+          7z x -y -o"$pv" "$TMP_DIR/pluginval.zip" > /dev/null
+          "$pv/pluginval.exe" --strictness-level 10 --verbose \
+            --output-dir "$TMP_DIR/pluginval-logs" \
+            --validate "$VST3_PATH"
+
+      - name: Guardar logs de pluginval si falla
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: pluginval-logs-windows
+          path: ${{ env.TMP_DIR }}/pluginval-logs
+          if-no-files-found: ignore
+
+  release:
+    name: Publicar release
+    if: startsWith(github.ref, 'refs/tags/plugin-v')
+    needs: [linux, windows]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: dist
+
+      - name: Crear el .zip
+        run: |
+          v="${GITHUB_REF_NAME#plugin-v}"
+          echo "ZIP_NAME=DJ-Edit-Cutter-$v-VST3-Windows.zip" >> "$GITHUB_ENV"
+          (cd dist && zip -r -X "../DJ-Edit-Cutter-$v-VST3-Windows.zip" .)
+          unzip -l "DJ-Edit-Cutter-$v-VST3-Windows.zip"
+
+      - name: Publicar en GitHub Releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          tag="$GITHUB_REF_NAME"
+          v="${tag#plugin-v}"
+          cat > notes.md <<EOF
+          Plugin VST3 de DJ Edit Cutter para el Mixer de FL Studio (Windows, 64 bits).
+
+          Descarga **$ZIP_NAME**, descomprímelo y sigue las instrucciones de LEEME.txt: copia la carpeta
+          «DJ Edit Cutter.vst3» en C:\\Program Files\\Common Files\\VST3 y en FL busca plugins nuevos en
+          Options > Manage plugins.
+          EOF
+          if gh release view "$tag" > /dev/null 2>&1; then
+            gh release upload "$tag" "$ZIP_NAME" --clobber
+          else
+            gh release create "$tag" "$ZIP_NAME" --verify-tag \
+              --title "DJ Edit Cutter $v (plugin VST3 para FL Studio)" --notes-file notes.md
+          fi

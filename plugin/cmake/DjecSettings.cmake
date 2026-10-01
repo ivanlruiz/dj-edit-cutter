@@ -16,13 +16,15 @@ endif()
 if(MSVC)
     # Runtime estático: el usuario no necesita instalar el redistribuible de Visual C++.
     set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
-    # Las fuentes están en UTF-8 (textos en castellano con tildes y eñes).
+    # Las fuentes están en UTF-8 (textos en castellano con tildes y eñes). Vale para todo, JUCE incluido.
     add_compile_options(/utf-8)
 endif()
 
 # Avisos para el core y sus tests (no son errores: varios ingenieros escriben código a la vez).
+# El plugin y djec_host_tests usan juce::juce_recommended_warning_flags en su lugar (no se mezclan:
+# MSVC avisaría de que /W3 pisa a /W4).
 if(MSVC)
-    set(DJEC_CORE_WARNING_FLAGS /W4 /permissive-)
+    set(DJEC_CORE_WARNING_FLAGS /W3 /permissive-)
 else()
     set(DJEC_CORE_WARNING_FLAGS -Wall -Wextra)
 endif()
